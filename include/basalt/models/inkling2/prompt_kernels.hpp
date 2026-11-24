@@ -27,7 +27,8 @@ struct AttnPromptArgs {
     const void* v_chunk = nullptr;     ///< (a full layer passes its cache again; a sliding-window layer the chunk's stage)
     int64_t chunk_cap = 0;
     bool fp8 = false;                  ///< unit-scale E4M3 codes instead of fp16
-    bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
+    bool int8 = false;                  ///< symmetric INT8 codes with two per-row FP16 scales
+    bool v4 = false;                    ///< [V4] the value rows are four-bit (keys keep their own format)
     int window = 0;                    ///< > 0: keys at distance < window only
     float scale = 0.08838834764831845f;
 };

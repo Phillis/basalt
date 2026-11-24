@@ -95,11 +95,69 @@ __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t u) {
     return (uint32_t) h.x | ((uint32_t) h.y << 16);
 }
 
+// [V4] 16 values of a four-bit row from its eight code bytes and their scale, rounded to fp16 pairs.
+__device__ __forceinline__ void v4x16_to_h8(const uint2 u, float scale, uint32_t (&h)[8]) {
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            const __half2 hv = __floats2half2_rn((float) (lo >= 8 ? lo - 16 : lo) * scale,
+                                                 (float) (hi >= 8 ? hi - 16 : hi) * scale);
+            h[2 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);
+        }
+}
 // One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
 // (cp.async, the caller commits and waits), E4M3 tiles converted and stored before the return.
-template <bool FP8, bool INT8>
+template <bool FP8, bool INT8, bool V4>
 __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, int kvh, int64_t k0, int64_t lo, int64_t hi, int tid) {
-    if constexpr (!FP8 && !INT8) {
+    if constexpr (V4) {   // [V4] keys in their own (fp8) format, values four-bit
+        constexpr int kPieces = kKeys * kHeadDim / 16;
+        for (int c = tid; c < kPieces; c += kThreads) {   // keys
+            const int j = c / (kHeadDim / 16), col = (c % (kHeadDim / 16)) * 16;
+            const int64_t key = k0 + j;
+            const bool ok = key >= lo && key <= hi;
+            uint4 u = make_uint4(0u, 0u, 0u, 0u);
+            if (ok) {
+                const bool fresh = key >= a.pos0;
+                const int64_t cap = fresh ? a.chunk_cap : a.cap;
+                const uint8_t* base = static_cast<const uint8_t*>(fresh ? a.k_chunk : a.k_cache);
+                const size_t row = ((size_t) (key % cap) * kKvHeads + kvh) * kHeadDim;
+                u = *reinterpret_cast<const uint4*>(base + row + col);
+            }
+            uint32_t h[8];
+            const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                h[2 * i] = e4m3x2_to_h2((uint16_t) (w[i] & 0xFFFFu));
+                h[2 * i + 1] = e4m3x2_to_h2((uint16_t) (w[i] >> 16));
+            }
+            __half* dst = &sm.k[j][col];
+            *reinterpret_cast<uint4*>(dst) = make_uint4(h[0], h[1], h[2], h[3]);
+            *reinterpret_cast<uint4*>(dst + 8) = make_uint4(h[4], h[5], h[6], h[7]);
+        }
+        for (int c = tid; c < kPieces; c += kThreads) {   // values: eight code bytes a 16-value group, a scale per 32
+            const int j = c / (kHeadDim / 16), col = (c % (kHeadDim / 16)) * 16;
+            const int64_t key = k0 + j;
+            const bool ok = key >= lo && key <= hi;
+            uint2 u = make_uint2(0u, 0u);
+            float sc = 1.f;
+            if (ok) {
+                const bool fresh = key >= a.pos0;
+                const int64_t cap = fresh ? a.chunk_cap : a.cap;
+                const uint8_t* base = static_cast<const uint8_t*>(fresh ? a.v_chunk : a.v_cache);
+                const size_t row = ((size_t) (key % cap) * kKvHeads + kvh) * kKvV4RowBytes;
+                u = *reinterpret_cast<const uint2*>(base + row + col / 2);
+                sc = __half2float(reinterpret_cast<const __half*>(base + row + kKvV4CodeBytes)[col / kKvV4Group]);
+            }
+            uint32_t h[8];
+            v4x16_to_h8(u, sc, h);
+            __half* dst = &sm.v[j][col];
+            *reinterpret_cast<uint4*>(dst) = make_uint4(h[0], h[1], h[2], h[3]);
+            *reinterpret_cast<uint4*>(dst + 8) = make_uint4(h[4], h[5], h[6], h[7]);
+        }
+    } else if constexpr (!FP8 && !INT8) {
         constexpr int kPieces = kKeys * kHeadDim / 8;   // 16-byte pieces of one tile
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
             const bool isv = c >= kPieces;
@@ -159,7 +217,7 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
     }
 }
 
-template <bool FP8, bool INT8>
+template <bool FP8, bool INT8, bool V4>
 __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnPromptArgs a, const int rows, float* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
@@ -215,13 +273,13 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
         __syncthreads();   // every warp is done with the previous tile
         if (!ready) {
             cur = 0;
-            load_tile<FP8, INT8>(a, sm.t0, kvh, k0, lo, hi, tid);
+            load_tile<FP8, INT8, V4>(a, sm.t0, kvh, k0, lo, hi, tid);
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
         // a far tile followed by a far tile: the next one is requested into the other room before this one is used
         const bool next = !FP8 && !INT8 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
         if (next) {
-            load_tile<FP8, INT8>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
+            load_tile<FP8, INT8, V4>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
             asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
         } else {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -374,14 +432,16 @@ void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* strea
     cudaStream_t s = (cudaStream_t) stream;
     static bool sized[kOptInDevices] = {};   // the opt-in is per device
     if (bool& z = sized[opt_in_device()]; !z) {
-        cudaFuncSetAttribute(attn_prompt_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_prompt_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_prompt_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+    cudaFuncSetAttribute(attn_prompt_kernel<true, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<false, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<false, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         z = true;
     }
-    if (a.int8) attn_prompt_kernel<false, true><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
-    else if (a.fp8) attn_prompt_kernel<true, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
-    else attn_prompt_kernel<false, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    if (a.v4) attn_prompt_kernel<true, false, true><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    else if (a.int8) attn_prompt_kernel<false, true, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    else if (a.fp8) attn_prompt_kernel<true, false, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    else attn_prompt_kernel<false, false, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
     check("attention_prompt");
 }
 
