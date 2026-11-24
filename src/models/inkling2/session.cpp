@@ -40,6 +40,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -387,6 +389,7 @@ public:
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
             if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, head, err)) return {model::Status::Error, "inkling2: " + err};
+            ++diag_forwards;   // [local diag]
             lookups_ += (int64_t) n * g_.n_used * (int64_t) g_.visits.size();
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
             head_rows_ = head;
@@ -1199,6 +1202,7 @@ private:
 
     void visits_and_head(int rows, int head, int64_t full_keys) {
         bk::PdlScope pdl(true);
+        if (diag_) diag_stamp(diag_t_, stream_);   // [local diag] visit 0's start
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         const float* blocks[kMaxMix];

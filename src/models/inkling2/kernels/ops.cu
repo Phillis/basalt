@@ -757,4 +757,17 @@ void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream) {
     check("softcap");
 }
 
+// [local diag] BASALT_DIAG_VISIT: the GPU's global timer (ns, one thread), so a captured graph can carry per-visit stamps
+__global__ void diag_stamp_kernel(unsigned long long* dst) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        *dst = t;
+    }
+}
+
+void diag_stamp(unsigned long long* dst, void* stream) {
+    diag_stamp_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(dst);
+}
+
 }  // namespace basalt::models::inkling2

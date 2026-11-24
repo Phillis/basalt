@@ -198,11 +198,20 @@ private:
     float* frc_ = nullptr;                  ///< the Markov head's context of the block (block inputs copy it)
     cudaGraphExec_t g_stage_[kDsMaxLayers] = {};
     cudaGraphExec_t g_head_[kDsBlock] = {};
+    // [W2] the block's attention as a graph per (layer, position bucket).  Its position arrives on the device (meta_d_ + 1),
+    // so one capture serves every position in its bucket: a capture cannot bake `pos`, `hi` or a full layer's window.
+    static constexpr int kDaShapeBuckets = 19;      // 2^0 .. 2^18 positions
+    cudaGraphExec_t g_attn_[kDsMaxLayers][kDaShapeBuckets] = {};
+    bool attn_capture_ = false;                     ///< [W2] capture the attention (`C:\LLM\dspark-capture.on`)
+    /// [W2] Launches layer `k`'s block attention as a graph (capturing it on first sight of its bucket). False: the caller
+    /// runs it directly, exactly as before.
+    bool attn_captured(int k, int64_t pos, void* stream);
     bool graphs_ = true;
     float* conf_h_ = nullptr;
     // the host's record: positions [lo_, hi_) have their context in the caches; a block is in flight
     int64_t lo_ = 0, hi_ = 0;
     int pending_ = 0;
+    cudaEvent_t ev_ = nullptr;              ///< [W-A] marks the end of this block's work, so draft_end waits on it and not the whole stream
     // --diag-dump
     std::FILE* dump_ = nullptr;
     int dumped_ = 0;
@@ -211,6 +220,9 @@ private:
     int64_t block_pos_ = 0;
     int32_t block_anchor_ = 0;
 };
+
+/// [W1] --prefill-waves: how many staging waves a spilled layer's prompt visit is split into (0 or 1 = the serial staging).
+extern int g_prefill_waves;
 
 /// The flags an Inkling 2 start takes for speculative decoding: --spec N, --draft-log FILE. False when `a` is neither.
 bool dspark_parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o);

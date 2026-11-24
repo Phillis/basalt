@@ -49,6 +49,10 @@ void moe_sort(const int32_t* ids, int rows, int k, int n_expert, void* scratch, 
 /// ids[i] = map[ids[i]] for `n` entries: a spilled layer's experts by their slot (spill.hpp).
 void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream);
 
+/// [W1] A wave of a layer's expert row bounds: `bounds` copied with every expert outside [e0, e1) made zero-length, so a
+/// product over `out` computes that wave's experts only.  In-wave experts keep their absolute row indices.
+void wave_bounds(const int32_t* bounds, int n, int e0, int e1, int32_t* out, void* stream);
+
 /// pos[i] = pos0 + i for a chunk's `rows` rows, and bounds = {0, rows} (the one-matrix products' row bounds).
 void prompt_rows(int32_t* pos, int64_t pos0, int rows, int32_t* bounds, void* stream);
 

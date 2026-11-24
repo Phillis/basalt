@@ -7,6 +7,8 @@
 // contributors to the vLLM project).
 #include "models/inkling2/dspark.hpp"
 
+#include <cstdio>
+
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/dense_ops.hpp"
@@ -315,6 +317,7 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
 // ---- the session's hook ---------------------------------------------------------------------------------------------------
 
 DsparkHook::~DsparkHook() {
+    if (ev_) cudaEventDestroy(ev_);
     for (cudaGraphExec_t g : g_stage_)
         if (g) cudaGraphExecDestroy(g);
     for (cudaGraphExec_t g : g_head_)
@@ -605,7 +608,10 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
     if (!g) {
         cudaGraph_t graph = nullptr;
         if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
-            (void) cudaGetLastError();
+            // A silent fallback here is a measurement trap (it looks exactly like a capture that works), so say it.
+            const cudaError_t bce = cudaGetLastError();
+            basalt::log::warn("basalt inkling2", "drafter: its attention's capture could not start (%s); it runs it directly",
+                              cudaGetErrorString(bce));
             return false;
         }
         stage(k, n, stream);
@@ -622,6 +628,52 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
     return cudaGraphLaunch(g, st) == cudaSuccess;
 }
 
+bool DsparkHook::attn_captured(int k, int64_t pos, void* stream) {
+    const DsparkGeometry& d = w_->geo;
+    const Cache& c = cache_[(size_t) k - 1];
+    // The bucket: the largest power of two not above `pos`.  Every position in it shares the graph.
+    int s = 0;
+    while (s + 1 < kDaShapeBuckets && ((int64_t) 1 << (s + 1)) <= pos) ++s;
+    const int64_t bl = (int64_t) 1 << s;
+    // A sliding layer's window is fixed; a full layer sees everything, and the bucket's floor makes the range `window`
+    // spans cover every position in it (row_lo clamps at 0), so `window` need not follow the position.
+    const int64_t window = c.ring ? (int64_t) d.window + 1 : bl + kDsBlock;
+    cudaGraphExec_t& g = g_attn_[(size_t) k - 1][s];
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (!g) {
+        cudaGraph_t graph = nullptr;
+        if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+            // A silent fallback here is a measurement trap (it looks exactly like a capture that works), so say it.
+            const cudaError_t bce = cudaGetLastError();
+            basalt::log::warn("basalt inkling2", "drafter: its attention's capture could not start (%s); it runs it directly",
+                              cudaGetErrorString(bce));
+            return false;
+        }
+        // pos_dev (meta_d_ + 1, which draft_begin has already filled), hi_off = kDsBlock: the kernel derives the real
+        // hi and the per-row chunk bounds from the device position, so the replay follows it.
+        bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, bl, kDsBlock, 0, window, c.cap, att_scr_, att_cells_,
+                            attn_, stream, true, meta_d_ + 1, kDsBlock);
+        const cudaError_t ce = cudaStreamEndCapture(st, &graph);
+        const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&g, graph, 0) : ce;
+        if (graph) cudaGraphDestroy(graph);
+        if (ci != cudaSuccess) {
+            (void) cudaGetLastError();
+            g = nullptr;
+            basalt::log::warn("basalt inkling2", "drafter: its attention's graph failed (%s); it runs it directly",
+                              cudaGetErrorString(ci));
+            return false;
+        }
+    }
+    if (cudaGraphLaunch(g, st) != cudaSuccess) {
+        const cudaError_t le = cudaGetLastError();
+        basalt::log::warn("basalt inkling2", "drafter: its attention's graph did not launch (%s); it runs it directly",
+                          cudaGetErrorString(le));
+        g = nullptr;
+        return false;
+    }
+    return true;
+}
+
 model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* stream) {
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     pending_ = 0;
@@ -636,17 +688,28 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
     // the stages captured as graphs (not with --diag-dump, whose head writes more); the attention between them runs
     // directly: its window follows the position
     if (dump_ || !stream) graphs_ = false;
+    // [W2] the block's attention as graphs too (`C:\LLM\dspark-capture.on`): it is the one part that ran directly, because
+    // its window followed the position.  A capture cannot bake the position, so it arrives on the device instead.
+    static const bool attn_capture_allowed = [] {
+        if (std::FILE* f = std::fopen("C:\\LLM\\dspark-capture.on", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    attn_capture_ = attn_capture_allowed && !dump_ && stream != nullptr;
     try {
         for (int k = 0; k <= d.n_layers; ++k) {
             if (k > 0) {
                 const Cache& c = cache_[(size_t) k - 1];
                 // a sliding-window layer sees its window before the block, the full one every position, and both the block
                 const int64_t window = c.ring ? (int64_t) d.window + 1 : pos + kDsBlock;
-                // the splits from the cells the block reads, not from the scratch's capacity (this call is not captured): a
-                // short context runs few splits; the drafts only shape the speed
+                // the splits from the cells the block reads, not from the scratch's capacity (a captured call, below, cannot
+                // shrink its grid: it is sized once for the bucket); a short context runs few splits, the drafts only shape speed
                 const int64_t cells = pos + kDsBlock - std::max<int64_t>(0, pos - window + 1) + 64;
-                bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap, att_scr_,
-                                    std::min(att_cells_, cells), attn_, stream, true);
+                if (!(attn_capture_ && attn_captured(k, pos, stream)))
+                    bk::gqa_window_attn(qr_, c.k, c.v, kHeads, kKvHeads, kHeadDim, pos, kDsBlock, pos + kDsBlock, window, c.cap,
+                                        att_scr_, std::min(att_cells_, cells), attn_, stream, true);
             }
             if (!graphs_ || !stage_graph(k, n, stream)) {
                 graphs_ = false;
@@ -657,6 +720,13 @@ model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* 
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }
     pending_ = n;
+    // [W-A] The drafter's work for this block is queued; mark where it ends so draft_end can wait for exactly this much
+    // instead of synchronising the whole stream (which also carries the main window's kernels).  That full-stream sync was
+    // ~9 ms of serial tax between windows - the reason spec 8 was only worth ~3.5% once the doorbell made a window cheap.
+    if (stream) {
+        if (!ev_) cudaEventCreateWithFlags(&ev_, cudaEventDisableTiming);
+        if (ev_) cudaEventRecord(ev_, (cudaStream_t) stream);
+    }
     block_pos_ = pos;
     block_anchor_ = anchor;
     return {};
@@ -667,7 +737,9 @@ model::Result DsparkHook::draft_end(int32_t* ids, float* conf, int max_n, int& n
     n = 0;
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
     if (pending_ == 0) return {};
-    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess)
+    // [W-A] wait on the drafter's own event, not the whole stream (see draft_begin)
+    const cudaError_t waited = ev_ ? cudaEventSynchronize(ev_) : cudaStreamSynchronize((cudaStream_t) stream);
+    if (waited != cudaSuccess)
         return {model::Status::Error, std::string("inkling2: the drafter: ") + cudaGetErrorString(cudaGetLastError())};
     n = std::min(pending_, max_n);
     for (int i = 0; i < n; ++i) {
@@ -777,8 +849,17 @@ bool dspark_parse_flag(const std::string& a, model::FlagArgs& args, program::Com
     if (a == "--spec") {
         o.spec = std::atoi(args.next("--spec"));
         o.spec_given = true;
+    } else if (a == "--prefill-waves") {
+        // [W1] The prompt staging's wave pipeline: N waves per spilled layer's visit (0 or 1 = the serial staging).
+        g_prefill_waves = std::max(0, std::atoi(args.next("--prefill-waves")));
     } else if (a == "--draft-log") {
         core::diagnostics().draft_log = args.next("--draft-log");
+    } else if (a == "--suffix-draft") {
+        // [W-B] Prompt-lookup drafting: filled windows come from an earlier repeat of the context, so they cost no drafter
+        // and reach dl 3-8 on repetitive content.  The machinery is generic (session_engine builds the SuffixDrafter when
+        // suffix_draft > 0 and copy_drafts()); inkling2 simply never parsed the flag, which is why the earlier test found
+        // "no gain" - nothing ran.
+        o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
     } else {
         return false;
     }

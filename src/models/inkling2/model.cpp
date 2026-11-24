@@ -830,8 +830,24 @@ model::Result InklingModel::attach(const model::LoadRequest&, std::vector<std::u
 
 uint64_t InklingModel::promote(uint64_t keep_free) {
     const int ne = geo().n_expert;
+    // [P2] Rank the copies by *staging frequency* rather than routing heat alone.  A prompt chunk stages a spilled layer's
+    // experts on EVERY visit of that layer, and the loop layers (loop_start..loop_end) are visited loop_passes times per
+    // chunk while the prelude and coda are visited once.  An elastic card copy stages D2D in VRAM instead of H2D across the
+    // host link, so a copy in a loop layer saves its blob loop_passes times per chunk for the same VRAM.  Ties keep the
+    // profile's routing order (stable_sort), so decode's hot experts still come first within a class.
+    if (promote_order_.empty() && !spill_order_.empty()) {
+        std::vector<int32_t> visits((size_t) geo().n_layers, 0);
+        for (const Visit& v : geo().visits)
+            if (v.layer >= 0 && v.layer < geo().n_layers) ++visits[(size_t) v.layer];
+        promote_order_ = spill_order_;
+        std::stable_sort(promote_order_.begin(), promote_order_.end(),
+                         [&](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
+                             return visits[(size_t) a.first] > visits[(size_t) b.first];
+                         });
+    }
+    const std::vector<std::pair<int32_t, int32_t>>& order = promote_order_.empty() ? spill_order_ : promote_order_;
     uint64_t moved = 0;
-    for (const auto& [l, e] : spill_order_) {
+    for (const auto& [l, e] : order) {
         const size_t i = (size_t) l * ne + e;
         if (copy_[i]) continue;
         const LayerWeights& w = layers_[(size_t) l];

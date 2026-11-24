@@ -351,7 +351,10 @@ struct Loader::Impl {
 
     bool alloc(uint8_t*& alloc, uint8_t*& aligned, uint64_t bytes) {
         if (pinned) {
-            if (cudaHostAlloc((void**) &alloc, (size_t) (bytes + kAlign), cudaHostAllocPortable) != cudaSuccess) {
+            const cudaError_t he = cudaHostAlloc((void**) &alloc, (size_t) (bytes + kAlign), cudaHostAllocPortable);
+            if (he != cudaSuccess) {
+                basalt::log::error("basalt", "pinned staging alloc of %llu MiB failed: %s",   // [local diag]
+                                   (unsigned long long) (bytes >> 20), cudaGetErrorString(he));
                 (void) cudaGetLastError();
                 alloc = nullptr;
                 return false;

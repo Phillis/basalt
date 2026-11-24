@@ -305,4 +305,8 @@ void moe_finish(const MoeFinish& a, int rows, void* stream);
 /// x = cap * tanh(x / cap) over rows of n values (row stride ld).
 void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream);
 
+/// [local diag] writes the GPU's global timer (ns, monotonic across SMs) into *dst; one tiny launch, capturable in a
+/// graph. BASALT_DIAG_VISIT only: the per-visit GPU-timeline stamps the session's diag reads back per window.
+void diag_stamp(unsigned long long* dst, void* stream);
+
 }  // namespace basalt::models::inkling2

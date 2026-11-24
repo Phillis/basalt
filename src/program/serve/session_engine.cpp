@@ -430,6 +430,8 @@ public:
         }
     }
     void decode_stats_begin() {
+        // [D3] the request begins: start the expert accounting over, then take the baseline (now all zeroes)
+        rt_.session().reset_expert_counts();
         counts0_ = rt_.session().expert_counts();
         draft_log_ = basalt::core::diagnostics().draft_log.empty() ? nullptr : rt_.draft_log();
         if (draft_log_ != nullptr) {
@@ -489,7 +491,24 @@ public:
     void relax_note_forced(int) {}
     int accept_drafts(int T) {
         int a = 0;
-        while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+        while (a < T - 1) {
+            if (window[(size_t) a + 1] == outv[(size_t) a]) {
+                ++a;
+                continue;
+            }
+            // [W4] Relaxed drafting (inkling2's DSpark, opt-in per request with `relax`): keep a draft the drafter was
+            // confident about (its proposal probability, `window_conf_`, which draft_end reports) even though the target's
+            // own draw differed.  The kept draft becomes that row's pick, so the next anchor and the emitted tokens read it,
+            // and the rows the window verified already assumed it.  Sampling only: a greedy request keeps the exact window.
+            if (req_relax > 0.0f && !req_sp.greedy && a < (int) window_conf_.size() &&
+                window_conf_[(size_t) a] >= req_relax) {
+                outv[(size_t) a] = window[(size_t) a + 1];
+                ++relaxed_kept_;
+                ++a;
+                continue;
+            }
+            break;
+        }
         return a;
     }
     bool resample_row(int row, int64_t, const std::vector<float>& bias, int32_t& tok, std::string& e) {
@@ -640,6 +659,7 @@ private:
     bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
+    int64_t relaxed_kept_ = 0;   ///< [W4] drafts kept by relaxed drafting rather than by the target's own draw
     int n_draft_ = 0;
     FILE* draft_log_ = nullptr;
     basalt::model::ModelSession::ExpertCounts counts0_;

@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <stdexcept>
 
@@ -115,6 +116,10 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.rw = c.take<float>(P);
     b.ids = c.take<int32_t>(P);
     b.bounds = c.take<int32_t>((size_t) g.n_expert + 1);
+    // [W1] one bounds/tile/blk set per staging wave (a wave's products read their own set while the next wave's copy runs)
+    b.wbounds = c.take<int32_t>((size_t) kMaxWaves * ((size_t) g.n_expert + 1));
+    b.wtile = c.take<int32_t>((size_t) kMaxWaves * ((size_t) g.n_expert + 1));
+    b.wblk = c.take<int32_t>((size_t) kMaxWaves * ((size_t) g.n_expert + 1));
     b.tok = c.take<int32_t>(P);
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
@@ -777,5 +782,9 @@ uint64_t prompt_bytes(const Geometry& g) {
     carve(c, b, g);
     return (uint64_t) c.at + kMmqSpare;
 }
+
+// [W1] --prefill-waves: 0 (the serial staging this engine always had), 1, or the wave count.  A namespace global because the
+// prompt path is built from the session's geometry and never sees CommonOptions; dspark_parse_flag sets it.
+int g_prefill_waves = 1;
 
 }  // namespace basalt::models::inkling2

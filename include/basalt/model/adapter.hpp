@@ -243,6 +243,9 @@ public:
     /// read from the file.
     struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0, files = 0; };
     virtual ExpertCounts expert_counts() const { return {}; }
+    /// [D3] Start the expert accounting over: the hit rate the server reports is per request, and a cumulative tally read
+    /// against a per-request denominator reads over 100% once promotion has moved experts between VRAM and RAM.
+    virtual void reset_expert_counts() {}
     /// The experts each GPU holds now (CUDA ordinal, slots, their VRAM bytes); empty without routed experts.
     struct CardExperts { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
     virtual std::vector<CardExperts> experts_by_card() const { return {}; }
