@@ -39,7 +39,7 @@ constexpr uint64_t kQ8Row = (uint64_t) kWidth / 32 * 34;   // bytes of a Q8_0 ro
 // driver
 constexpr uint64_t kSharedFixed = 768 * kMiB;
 constexpr uint64_t kSessionFixed = 96 * kMiB;
-constexpr uint64_t kCardSpare = 1024 * kMiB;
+constexpr uint64_t kCardSpare = 768 * kMiB;
 
 // The fused projection rows of a layer: tensor suffix, first row, rows, needed on a full layer only.
 struct ProjPart {

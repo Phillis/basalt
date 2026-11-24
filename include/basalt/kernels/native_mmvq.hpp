@@ -67,6 +67,13 @@ void native_q8_0_mmvq_segments(const void* weights, const Q80Segments& seg, int 
 
 // Bitwise-identical Q8_0 MMVQ over plane-separated weights (wgemm::q8_planes: int8 codes [total_rows][n_in], then
 // fp16 scales [total_rows][n_in / 32]). Aligned code loads; shares the code plane zero-copy with prefill::q8.
+// Which path the plane MMVQ takes is a threshold: the tensor-core form (16 rows a block, any ncols) above a column count,
+// the one-row-per-warp form below it. It was 4 columns for a big matrix and 7 for a small one, chosen without a parity
+// check below 4, and our decode window carries 3 columns - so this is settable to measure and to bit-check the two paths
+// against each other. large/small are the column counts at which each size class takes the tensor-core form;
+// 99 forces the warp form everywhere, 0 the tensor-core form. BASALT_Q8P_MMA_COLS="large,small" sets it at first use.
+void native_q8_planes_set_mma_cols(int large, int small);
+void native_q8_planes_get_mma_cols(int& large, int& small);
 void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                            void* stream);
 void native_q8_planes_mmvq_segments(const void* planes, int total_rows, const Q80Segments& seg, int n_in, int ncols,

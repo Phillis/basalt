@@ -431,8 +431,9 @@ void test_attention_prompt() {
             a.k_chunk = window ? st : kc;
             a.v_chunk = window ? sv : vc;
             a.chunk_cap = window ? R : cap;
-            a.fp8 = kv == kE4M3;
+            a.fp8 = kv == kE4M3 || kv == kV4;
             a.int8 = kv == kI8;
+            a.v4 = kv == kV4;   // the bench allocates v_cache in four-bit rows for this format
             a.window = window ? kExtent : 0;
             const double us = time_us([&] { attention_prompt(a, R, out, S); }, 10);
             double pairs = 0;   // (query, key) pairs

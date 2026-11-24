@@ -2466,9 +2466,21 @@ __global__ void __launch_bounds__(256) native_q8p_mma_seg_kernel(Q8Planes w, Seg
     q8p_mma_body(q8p_offset(w, p.row0, n_in), p.x, p.y, n_in, p.n_out, ncols, p.bx);
 }
 
+// The tensor-core form's column thresholds (see native_mmvq.hpp); read from the environment once.
+int g_q8p_mma_large = 4, g_q8p_mma_small = 7;
+bool g_q8p_mma_cols_read = false;
+void q8p_read_mma_cols() {
+    if (g_q8p_mma_cols_read) return;
+    g_q8p_mma_cols_read = true;
+    const char* e = std::getenv("BASALT_Q8P_MMA_COLS");
+    if (e == nullptr) return;
+    int a = 0, b = 0;
+    if (std::sscanf(e, "%d,%d", &a, &b) == 2) { g_q8p_mma_large = a; g_q8p_mma_small = b; }
+}
 void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const dim3 threads(WARP, WARPS);
-    if (n_in >= 1024 && mmvq_mma_sms() != 0 && ((n_out >= 65536 && ncols >= 4) || (n_out >= 4096 && ncols >= 7))) {
+    q8p_read_mma_cols();
+    if (n_in >= 1024 && mmvq_mma_sms() != 0 && ((n_out >= 65536 && ncols >= g_q8p_mma_large) || (n_out >= 4096 && ncols >= g_q8p_mma_small))) {
         launch_pdl(native_q8p_mma_kernel, dim3(unsigned((n_out + 15) / 16)), dim3(256), 0, s, w, x, y, n_in, n_out, ncols);
         return;
     }
@@ -2487,6 +2499,17 @@ void launch_q8p(Q8Planes w, const Q81Block* x, float* y, int n_in, int n_out, in
 
 }  // namespace
 
+void native_q8_planes_set_mma_cols(int large, int small) {
+    g_q8p_mma_large = large;
+    g_q8p_mma_small = small;
+    g_q8p_mma_cols_read = true;   // an explicit setting wins over the environment
+}
+
+void native_q8_planes_get_mma_cols(int& large, int& small) {
+    q8p_read_mma_cols();
+    large = g_q8p_mma_large;
+    small = g_q8p_mma_small;
+}
 void native_q8_planes_mmvq(const void* planes, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                            void* stream) {
     validate_shape(n_in, ncols, 32);
