@@ -1113,18 +1113,32 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
         cudaFuncSetAttribute(attn_fused_kernel<false, false, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         cudaFuncSetAttribute(attn_fused_kernel<true, false, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         cudaFuncSetAttribute(attn_fused_kernel<false, true, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, false, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<true, false, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, true, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         cudaFuncSetAttribute(attn_fused_kernel<false, false, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
         cudaFuncSetAttribute(attn_fused_kernel<true, false, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
         cudaFuncSetAttribute(attn_fused_kernel<false, true, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<false, false, true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<true, false, true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<false, true, true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
     if (rows <= 2) {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        if (a.v4) {   // [V4] four-bit value rows
+            if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+            else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+            else bk::launch_pdl(attn_fused_kernel<false, false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        } else if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
         else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
         else bk::launch_pdl(attn_fused_kernel<false, false, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
     } else {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        if (a.v4) {   // [V4] four-bit value rows
+            if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+            else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+            else bk::launch_pdl(attn_fused_kernel<false, false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        } else if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
         else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
         else bk::launch_pdl(attn_fused_kernel<false, false, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
     }
