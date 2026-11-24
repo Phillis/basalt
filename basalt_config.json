@@ -13,8 +13,7 @@
             "ram-reserve-mib": 512,
             "expert-cache": "auto",
             "spec": 8,
-            "prompt-cache": 6,
-            "reasoning-effort": "medium"
+            "prompt-cache": 6
         }
     ],
     "server": {
