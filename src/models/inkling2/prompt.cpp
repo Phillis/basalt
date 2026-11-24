@@ -100,7 +100,7 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.msg = c.take<float>(4 * R * E);
     b.mix = c.take<float>(3 * R * E);
     b.hid = c.take<float>(R * (size_t) g.gate_rank);
-    b.nrm = c.take<float>(3 * R * E);
+    b.nrm = c.take<float>(R * E);   // [arena] R x E: every use of it is the chunk's own rows
     b.yq = c.take<float>(R * kProjQ);
     b.yk = c.take<float>(R * kProjKV);
     b.yv = c.take<float>(R * kProjKV);
