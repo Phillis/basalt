@@ -60,7 +60,7 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8") {
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8" && o.kv != "fp8v4") {
             basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8 or int8", o.kv.c_str());
             return 2;
         }

@@ -26,7 +26,7 @@ constexpr int kv_cache_row_bytes(bool fp8, bool int8) { return fp8 ? kHeadDim : 
 constexpr int kKvV4Group = 32;                                  ///< values one fp16 scale covers
 constexpr int kKvV4Groups = kHeadDim / kKvV4Group;              ///< scales a row
 constexpr int kKvV4CodeBytes = kHeadDim / 2;                    ///< two 4-bit codes a byte
-constexpr int kKvV4RowBytes = kKvV4CodeBytes + 2 * kKvV4Groups;  ///< codes then fp16 scales: 64 + 8 = 72
+constexpr int kKvV4RowBytes = (kKvV4CodeBytes + 2 * kKvV4Groups + 15) & ~15;   ///< codes, scales, then zero pad to 16 bytes: 80
 constexpr int kKvV4CodeMin = -8, kKvV4CodeMax = 7;              ///< a four-bit two's complement code
 // [V4] A value row's bytes for a cache format: the compressed row when v4, else the key's own format.
 constexpr int kv_v_row_bytes(bool fp8, bool int8, bool v4) { return v4 ? kKvV4RowBytes : kv_cache_row_bytes(fp8, int8); }
@@ -97,6 +97,7 @@ struct AttnPrep {
     int64_t ldq = kProjQ, ldk = kProjKV, ldv = kProjKV;
     const int32_t* pos = nullptr;      ///< position of each row [rows]
     bool full = false;                 ///< a full-attention layer: per-token taps, log-scaled q and r
+    bool v4 = false;                   ///< [V4] the value rows are four-bit
     const float* k_conv = nullptr;     ///< the key convolution's static taps [1024][kConv], tap kConv-1 the current token
     const float* v_conv = nullptr;
     const float* q_scale = nullptr;    ///< [kHeads][kHeadDim]

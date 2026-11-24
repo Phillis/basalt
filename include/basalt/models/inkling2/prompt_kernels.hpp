@@ -61,7 +61,7 @@ void prompt_rows(int32_t* pos, int64_t pos0, int rows, int32_t* bounds, void* st
 /// (cell p % ring_cap): positions max(pos0, end - keep) .. end - 1, end = pos0 + rows. A cell is [kKvHeads][kHeadDim] of
 /// `row_bytes` bytes per KV head row (fp16, E4M3 or scaled INT8).
 void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
-                   int64_t pos0, int rows, int keep, int row_bytes, void* stream);
+                   int64_t pos0, int rows, int keep, int row_bytes, int v_row_bytes, void* stream);
 
 /// Fused prompt loop controller down projection: RMS-normalizes dest and msg independently and computes
 /// hid[r][o] = w_down[o][0..kWidth) . rms(dest[r]) + w_down[o][kWidth..2*kWidth) . rms(msg[r]).

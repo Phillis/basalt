@@ -288,6 +288,7 @@ public:
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         const int64_t E = g_.n_embd, R = kMaxRows;
         const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8());
+        const size_t v_row_bytes = (size_t) kv_v_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_v4());
         const int64_t ctx = m_.context();
         int max_slot = 0;
         for (const Visit& v : g_.visits) max_slot = std::max(max_slot, v.slot);
@@ -299,18 +300,20 @@ public:
             cudaSetDevice(m_.card_device(m_.card_of(v.layer)));   // a visit's caches on its layer's card
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kMaxRows : ctx;
-            const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
+            const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;      // the keys
+            const size_t v_bytes = (size_t) kKvHeads * (size_t) c.cap * v_row_bytes;  // the values
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
-                    if (ok && (!a->open(bytes, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
+                    const size_t nb = j ? v_bytes : bytes;
+                    if (ok && (!a->open(nb, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
                     (j ? c.v : c.k) = a->data();
                     elastic_.push_back(std::move(a));
                 }
                 backed_ = core::kElasticKvBase;
             } else {
                 c.k = alloc(bytes, ok);
-                c.v = alloc(bytes, ok);
+                c.v = alloc(v_bytes, ok);
             }
             c.k_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
             c.v_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
@@ -590,12 +593,15 @@ public:
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
     size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
+    size_t v_row_bytes() const { return (size_t) kv_v_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_v4()); }
     // [609] A read that failed past its start leaves the conversation's state unknown: only a new conversation
     // (position 0) or a restored checkpoint may go on.
     static model::Result stale() {
         return {model::Status::Error, "inkling2: a failed read left the conversation's state unknown: start it over or restore a checkpoint"};
     }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
+
+    uint64_t v_cell_bytes() const { return (uint64_t) kKvHeads * v_row_bytes(); }   // [V4]
 
     // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
     // and when the card has no room the RAM experts' card copies go back to RAM first, the least routed first. False when
@@ -640,6 +646,7 @@ public:
         }
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * row_bytes(); }
+    size_t v_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * v_row_bytes(); }   // [V4]
     size_t conv_ring_bytes() const { return (size_t) kConvRing * (2 * kKvHeads * kHeadDim + 2 * (size_t) g_.n_embd) * 4; }
 
     size_t running_bytes() const override {
@@ -659,7 +666,7 @@ public:
             std::vector<core::DeviceRegion>& to = slot_card_[i] ? st.peer_regions : st.regions;
             if (c.ring) {
                 to.push_back({c.k, kv_bytes_of(c)});
-                to.push_back({c.v, kv_bytes_of(c)});
+                to.push_back({c.v, v_bytes_of(c)});
             }
             to.push_back({c.k_ring, kv_ring});
             to.push_back({c.v_ring, kv_ring});
@@ -685,7 +692,7 @@ public:
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
         for (const VisitCache& c : vc_)
-            if (!c.ring) n += 2 * (size_t) positions * cell_bytes();
+            if (!c.ring) n += (size_t) positions * (cell_bytes() + v_cell_bytes());   // [V4] keys and values differ
         return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
@@ -695,7 +702,10 @@ public:
         if (positions > m_.context()) return {model::Status::Error, "inkling2: positions past the context"};
         cudaStreamSynchronize(stream_);
         kv.clear();
+
         const size_t run = (size_t) positions * cell_bytes();
+
+        const size_t v_run = (size_t) positions * v_cell_bytes();   // [V4]
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
             core::ConversationKv k;
@@ -705,7 +715,8 @@ public:
             k.heads = kKvHeads;
             k.head_dim = kHeadDim;
             k.k.resize_for_overwrite(run);
-            k.v.resize_for_overwrite(run);
+
+            k.v.resize_for_overwrite(v_run);
             const auto down = [](const void* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
                     return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -723,11 +734,14 @@ public:
         if (std::string e; !ensure_positions(positions, e)) return {model::Status::Refused, "inkling2: " + e};
         cudaStreamSynchronize(stream_);
         const size_t run = (size_t) positions * cell_bytes();
+
+        const size_t v_run = (size_t) positions * v_cell_bytes();   // [V4]
+
         size_t i = 0;
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
             if (i >= kv.size() || kv[i].format != cell_format() || kv[i].cells != positions || kv[i].heads != kKvHeads ||
-                kv[i].k.size() < run || kv[i].v.size() < run)
+                kv[i].k.size() < run || kv[i].v.size() < v_run)
                 return {model::Status::Error, "inkling2: a parked conversation has other caches"};
             const auto up = [&](void* dev, const core::ConversationBuffer& from) {
                 return from.visit(0, run, [&](const uint8_t* p, size_t n, size_t at) {
@@ -926,6 +940,7 @@ private:
         ap.cap = c.cap;
         ap.fp8 = m_.cache_fp8();
         ap.int8 = m_.cache_int8();
+        ap.v4 = m_.cache_v4();
         ap.q = x.q_;
         ap.r = x.r_;
         ap.sink = x.sink_;
@@ -941,6 +956,7 @@ private:
         aa.cap = c.cap;
         aa.fp8 = m_.cache_fp8();
         aa.int8 = m_.cache_int8();
+        aa.v4 = m_.cache_v4();
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         aa.gate = ap.yq + kOffGate;
