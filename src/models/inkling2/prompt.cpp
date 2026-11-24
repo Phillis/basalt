@@ -116,10 +116,6 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.rw = c.take<float>(P);
     b.ids = c.take<int32_t>(P);
     b.bounds = c.take<int32_t>((size_t) g.n_expert + 1);
-    // [W1] one bounds/tile/blk set per staging wave (a wave's products read their own set while the next wave's copy runs)
-    b.wbounds = c.take<int32_t>((size_t) kMaxWaves * ((size_t) g.n_expert + 1));
-    b.wtile = c.take<int32_t>((size_t) kMaxWaves * ((size_t) g.n_expert + 1));
-    b.wblk = c.take<int32_t>((size_t) kMaxWaves * ((size_t) g.n_expert + 1));
     b.tok = c.take<int32_t>(P);
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);

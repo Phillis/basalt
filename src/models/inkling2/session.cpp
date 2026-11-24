@@ -389,7 +389,6 @@ public:
             const bool want = r.row_tokens || (last && (r.next_token || r.logits));
             const int head = !want ? 0 : r.row_tokens ? n : 1;
             if (!forward(r.tokens + t0, nullptr, n, r.pos + t0, head, err)) return {model::Status::Error, "inkling2: " + err};
-            ++diag_forwards;   // [local diag]
             lookups_ += (int64_t) n * g_.n_used * (int64_t) g_.visits.size();
             for (int i = 0; i < n; ++i) hist_.push_back(r.tokens[t0 + i]);
             head_rows_ = head;
@@ -483,18 +482,6 @@ public:
     model::Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, model::ImageGrid& grid) override {
         ImageEncoder& enc = m_.encoder();
         if (!enc.staged()) return {model::Status::NotImplemented, "inkling2: started without --vision"};
-        if (m_.elastic()) {
-            size_t free_b = 0, total_b = 0;
-            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess)
-                return {model::Status::Error, "inkling2: cannot query room for the image encoder"};
-            const uint64_t need = enc.region_bytes() + kElasticKeep;
-            const uint64_t available = free_b + enc.device_bytes();
-            if (available < need) {
-                const uint64_t freed = m_.demote(need - available, stream_);
-                basalt::log::info("basalt inkling2", "elastic spill: image encoder reclaims %.2f GiB of expert copies",
-                                  (double) freed / (double) (1ull << 30));
-            }
-        }
         std::string err;
         if (!enc.encode(data, bytes, rows, n_rows, grid, err)) return {model::Status::Error, "inkling2: " + err};
         if (n_rows <= 0 || rows.size() != (size_t) n_rows * (size_t) g_.n_embd)
@@ -603,6 +590,11 @@ public:
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kMaxRows
     // rows past it.
     size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
+    // [609] A read that failed past its start leaves the conversation's state unknown: only a new conversation
+    // (position 0) or a restored checkpoint may go on.
+    static model::Result stale() {
+        return {model::Status::Error, "inkling2: a failed read left the conversation's state unknown: start it over or restore a checkpoint"};
+    }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
 
     // The elastic KV: before a run reaches `positions`, the full visits' caches back them (in steps of kElasticKvStep cells),
@@ -1204,7 +1196,6 @@ private:
 
     void visits_and_head(int rows, int head, int64_t full_keys) {
         bk::PdlScope pdl(true);
-        if (diag_) diag_stamp(diag_t_, stream_);   // [local diag] visit 0's start
         const int E = g_.n_embd;
         const size_t RE = (size_t) rows * E;
         const float* blocks[kMaxMix];
@@ -1430,6 +1421,7 @@ private:
     std::vector<int32_t> hist_;
     float *d_bias_ = nullptr, *d_mask_ = nullptr;
     bool bias_on_ = false;
+    bool stale_ = false;   // [609] a read failed past its start
     int32_t* d_hist_ = nullptr;
     size_t d_hist_len_ = 0;
     int history_len_ = 0;

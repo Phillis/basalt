@@ -219,6 +219,7 @@ private:
     uint64_t reserve_ = 0;
     bool lent_ = false;
     std::vector<std::pair<int32_t, int32_t>> spill_order_;
+    std::vector<std::pair<int32_t, int32_t>> promote_order_;   ///< [P2] the same ranked by staging frequency (promote's order)
     std::vector<void*> copy_;
     int64_t n_copy_ = 0;
     std::vector<int> layer_copies_;   ///< [layer] RAM experts with a card copy
