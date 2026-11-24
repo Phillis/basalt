@@ -127,6 +127,21 @@ __device__ __forceinline__ void v4_row_scales(const uint8_t* row, float (&s)[kKv
 #pragma unroll
     for (int g = 0; g < kKvV4Groups; ++g) s[g] = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[g]);
 }
+// [V4] 32 values of a row from one 16-byte load (32 four-bit codes, exactly one scale group) as fp16 pairs: the
+// four-bit codes are small integers, so the convert is an integer one and the scale a half2 multiply.
+__device__ __forceinline__ void unpack32_v4(const uint4 u, float scale, uint32_t (&h)[16]) {
+    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+    const __half2 s2 = __float2half2_rn(scale);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {   // four bytes a word, a byte two values
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            const __half2 hv = __hmul2(__halves2half2(__int2half_rn(lo - ((lo & 8) << 1)),
+                                                      __int2half_rn(hi - ((hi & 8) << 1))), s2);
+            h[4 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);
+        }
+}
 // 16 values of a row from its eight code bytes and their scale, as fp32.
 __device__ __forceinline__ void unpack16_v4(const uint2 u, float scale, float (&f)[16]) {
     const uint32_t w[2] = {u.x, u.y};
@@ -234,11 +249,11 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
             const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
-            if constexpr (V4) {   // [V4] a 16-value group is eight bytes, not sixteen
+            if constexpr (V4) {   // [V4] 64 code bytes: four 16-byte loads, each one 32-value scale group
                 const size_t vcell = (size_t) (key % a.cap) * kKvHeads * kVRowBytes;
-                const uint2* vp = reinterpret_cast<const uint2*>(vbase + vcell);
-#pragma unroll
-                for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(vp[i].x, vp[i].y, 0u, 0u);
+                const uint4* vp = reinterpret_cast<const uint4*>(vbase + vcell);
+#pragma unroll
+for (int i = 0; i < kHeadDim / 32; ++i) vr[i] = vp[i];
                 v4_row_scales(vbase + vcell, vs);
             } else {
                 const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
@@ -311,14 +326,11 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
         uint32_t* vrow = sm.v[w][lane];
         if constexpr (V4) {
 #pragma unroll
-            for (int i = 0; i < kLoads; ++i) {
-                float f[16];
-                unpack16_v4(make_uint2(vr[i].x, vr[i].y), vs[i / 2], f);
+            for (int i = 0; i < kHeadDim / 32; ++i) {
+                uint32_t h[16];
+                unpack32_v4(vr[i], vs[i], h);
 #pragma unroll
-                for (int d = 0; d < 8; ++d) {
-                    const __half2 hv = __floats2half2_rn(f[2 * d], f[2 * d + 1]);
-                    vrow[8 * i + d] = *reinterpret_cast<const uint32_t*>(&hv);
-                }
+                for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
             }
         } else if constexpr (INT8) {
 #pragma unroll
@@ -733,9 +745,9 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
         for (int i = 0; i < kLoads; ++i) kr[i] = reinterpret_cast<const uint4*>(kbase + cell)[i];
         if constexpr (V4) {
             const size_t vcell = (size_t) (key % a.cap) * kKvHeads * kVRowBytes;
-            const uint2* vp = reinterpret_cast<const uint2*>(vbase + vcell);
-#pragma unroll
-            for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(vp[i].x, vp[i].y, 0u, 0u);
+            const uint4* vp = reinterpret_cast<const uint4*>(vbase + vcell);
+#pragma unroll
+for (int i = 0; i < kHeadDim / 32; ++i) vr[i] = vp[i];
             v4_row_scales(vbase + vcell, vs);
         } else {
 #pragma unroll
@@ -834,9 +846,9 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
             if constexpr (V4) {
-                const uint2* vp = reinterpret_cast<const uint2*>(fs.vw[key - p0]);
+                const uint4* vp = reinterpret_cast<const uint4*>(fs.vw[key - p0]);
 #pragma unroll
-                for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(vp[i].x, vp[i].y, 0u, 0u);
+                for (int i = 0; i < kHeadDim / 32; ++i) vr[i] = vp[i];
                 v4_row_scales(fs.vw[key - p0], vs);
             } else {
                 const uint4* vp = reinterpret_cast<const uint4*>(fs.vw[key - p0]);
@@ -887,16 +899,13 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             uint32_t* vrow = sm.v[w][lane];
             if constexpr (V4) {
 #pragma unroll
-                for (int i = 0; i < kLoads; ++i) {
-                    float f[16];
-                    unpack16_v4(make_uint2(vr[i].x, vr[i].y), vs[i / 2], f);
+            for (int i = 0; i < kHeadDim / 32; ++i) {
+                uint32_t h[16];
+                unpack32_v4(vr[i], vs[i], h);
 #pragma unroll
-                    for (int d = 0; d < 8; ++d) {
-                        const __half2 hv = __floats2half2_rn(f[2 * d], f[2 * d + 1]);
-                        vrow[8 * i + d] = *reinterpret_cast<const uint32_t*>(&hv);
-                    }
-                }
-            } else if constexpr (INT8) {
+                for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
+            }
+        } else if constexpr (INT8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) {
                     uint32_t h[8];
