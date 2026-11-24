@@ -105,7 +105,7 @@ __device__ __forceinline__ void v4x16_to_h8(const uint2 u, float scale, uint32_t
             const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
             const __half2 hv = __floats2half2_rn((float) (lo >= 8 ? lo - 16 : lo) * scale,
                                                  (float) (hi >= 8 ? hi - 16 : hi) * scale);
-            h[2 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);
+            h[4 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);   // four half2 a word
         }
 }
 // One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
