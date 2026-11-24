@@ -343,6 +343,7 @@ void test_attention_prompt() {
                 d.cap = cap;
                 d.fp8 = a.fp8;
                 d.int8 = a.int8;
+                d.v4 = a.v4;   // [V4] without it the full-cache cases take the MMA path and read 80-byte rows as 16-byte
                 d.window = a.window;
                 const int64_t max_keys = window ? kExtent : pos0 + R;
                 void* scr = zeros<uint8_t>(attention_decode_scratch(8, max_keys));
@@ -1342,6 +1343,7 @@ void test_dense() {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash must not swallow the line that shows where
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("no GPU\n");

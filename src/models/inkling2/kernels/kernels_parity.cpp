@@ -811,7 +811,9 @@ void test_controllers() {
 }
 
 void test_decode_prepare() {
+    for (int mode = 0; mode < 3; ++mode)
     for (bool full : {false, true}) {
+        const bool fp8 = mode >= 1, v4 = mode == 2;
         const int R = 4, p0 = full ? 9000 : 1;
         const int64_t cap = full ? 9100 : kExtent + 8;
         std::vector<int> pos(R);
@@ -830,16 +832,22 @@ void test_decode_prepare() {
         AttnPrep b = a;
         for (AttnPrep* x : {&a, &b}) {
             x->k_ring = dev(kr); x->v_ring = dev(vr);
-            x->k_cache = zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim); x->v_cache = zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim);
+            x->fp8 = fp8; x->v4 = v4;
+            x->k_cache = fp8 ? (void*) zeros<uint8_t>((size_t) kKvHeads * cap * kHeadDim)
+                            : (void*) zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim);
+            x->v_cache = v4 ? (void*) zeros<uint8_t>((size_t) kKvHeads * cap * kKvV4RowBytes)
+                           : fp8 ? (void*) zeros<uint8_t>((size_t) kKvHeads * cap * kHeadDim)
+                                 : (void*) zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim);
             x->q = zeros<float>((size_t) R * kHeads * kHeadDim); x->r = zeros<float>((size_t) R * kHeads * kRel); x->sink = zeros<float>((size_t) R * kHeads);
         }
         decode_prepare(a, R, nullptr);
         attn_prepare(b, R, nullptr);
         cudaDeviceSynchronize();
-        const size_t kvb = (size_t) kKvHeads * cap * kHeadDim * 2;
+        const size_t kvb = (size_t) kKvHeads * cap * (fp8 ? kHeadDim : 2 * kHeadDim);
+        const size_t vkb = (size_t) kKvHeads * cap * (v4 ? kKvV4RowBytes : (fp8 ? kHeadDim : 2 * kHeadDim));
         const char* tag = full ? "decode_prepare (full)" : "decode_prepare (window)";
         bool same = !std::memcmp(host((uint8_t*) a.k_cache, kvb).data(), host((uint8_t*) b.k_cache, kvb).data(), kvb) &&
-                    !std::memcmp(host((uint8_t*) a.v_cache, kvb).data(), host((uint8_t*) b.v_cache, kvb).data(), kvb) &&
+                    !std::memcmp(host((uint8_t*) a.v_cache, vkb).data(), host((uint8_t*) b.v_cache, vkb).data(), vkb) &&
                     host(a.q, (size_t) R * kHeads * kHeadDim) == host(b.q, (size_t) R * kHeads * kHeadDim) &&
                     host(a.r, (size_t) R * kHeads * kRel) == host(b.r, (size_t) R * kHeads * kRel) &&
                     host(a.sink, (size_t) R * kHeads) == host(b.sink, (size_t) R * kHeads) &&
@@ -1222,7 +1230,8 @@ int main() {
     }
     test_mix();
     test_ctrl();
-    test_prepare();
+    test_prepare();
+
     test_prepare_v4();
     test_attention();
     test_post_conv();
