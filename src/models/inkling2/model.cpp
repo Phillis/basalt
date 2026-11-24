@@ -1250,7 +1250,9 @@ bool InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
 // path's view of the staging) stay as they are.
 bool InklingModel::loan_ready() {
     if (loan_state_ != 0) return loan_state_ > 0;
-    if (!elastic_ || sessions() < 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
+    // one session only: the loan's VA range is the arena, and with two sessions one session's decode keeps copies
+    // loaned in it while the other reads a prompt into it - that crashed (access violation in the prompt read).
+    if (!elastic_ || sessions() != 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
     loan_state_ = -1;
     if (cudaHostAlloc((void**) &loan_addr_, spill_order_.size() * sizeof(unsigned long long), cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();
