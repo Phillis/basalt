@@ -1,4 +1,4 @@
-﻿# Inkling-2 fork notes
+# Inkling-2 fork notes
 
 Everything measured on this fork, kept with the code so the reasoning travels with it. Started from
 `jesdga95/basalt` and this fork's engine tree; hardware is one **RTX 5070 Ti Laptop (12 GB, sm_120)**,
