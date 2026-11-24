@@ -152,6 +152,21 @@ Flow Request::complete() {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }
+        // A request admitted to a slot (BGEN: in_slot, not solo_req) owns that slot's conversation, and its chain - the
+        // turn checkpoint and the generation-header one - has to go back into the slot here, before the solo session's
+        // state replaces the runtime's a few lines below. Without this a slot request's chain was simply dropped: the
+        // batch path kept only what admission saw (the root), so the next turn mounted 12 tokens and re-read the whole
+        // context. Only when the slot still holds this conversation (the batch round marks it cached at BDONE).
+        // (the solo path sets sb.cached itself at L141 rather than testing it: this slot now holds this conversation)
+        if (!solo_req && !cancelled && slot_b >= 0 && (size_t) slot_b < runtime_.bs.size() &&
+            runtime_.o.prompt_cache > 0 && runtime_.live_ok && !runtime_.checks.empty()) {
+            BSlot& sb = runtime_.bs[(size_t) slot_b];
+            sb.ids = runtime_.live;
+            sb.imgs = runtime_.live_imgs;
+            sb.cvec = runtime_.cvec_cached;
+            sb.checks = std::move(runtime_.checks);
+            sb.cached = true;
+        }
         runtime_.solo_out = nullptr;
         runtime_.live = std::move(solo_book.live);
         runtime_.live_imgs = std::move(solo_book.live_imgs);
