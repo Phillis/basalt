@@ -898,7 +898,9 @@ bool dspark_parse_flag(const std::string& a, model::FlagArgs& args, program::Com
         // [prefill] Rows of one prompt chunk (prompt.hpp): more rows amortise a spilled layer's staging over more
         // of them, fewer leave the card more room for the expert copies decode reads. 1,024 is the routed cutoff.
         const int n = std::atoi(args.next("--prompt-chunk"));
-        if (n >= 1024) kPromptChunk = std::min(16384, n);
+        // 2,048 is the floor: below it the NVFP4 experts' activation planes outgrow the q8 row buffer that
+        // carve() shares with them ("the FP4 planes outgrow xq"), and 16,384 does not fit beside a 262k cache.
+        if (n >= 2048) kPromptChunk = std::min(16384, n);
     } else if (a == "--prefill-waves") {
         // [W1] The prompt staging's wave pipeline: N waves per spilled layer's visit (0 or 1 = the serial staging).
         g_prefill_waves = std::max(0, std::atoi(args.next("--prefill-waves")));
