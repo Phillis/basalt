@@ -114,6 +114,10 @@ public:
     /// computes them again (on `stream`, which is waited for before the copies are freed). Bytes freed.
     uint64_t demote(uint64_t bytes, void* stream);
     int64_t promoted() const { return n_copy_; }
+    /// [609] Layer l's slot of each expert in its card range (spill.hpp), and the expert's card copy when the elastic spill
+    /// holds one. The prompt path stages only the RAM slots its chunk routes to, which needs both.
+    const int32_t* slots_of(int l) const { return spill_.slot[(size_t) l].data(); }
+    const void* copy_of(int l, int e) const { return copy_.empty() ? nullptr : copy_[(size_t) l * geo().n_expert + e]; }
     /// The free VRAM the session holds the card at from now on (VRAM / POST /v1/vram; 0: its own spare only): a grow of
     /// the caches and a promote keep at least this much free. `lend(true)` gives every card copy back for a sleep and holds them off (nothing promotes)
     /// until `lend(false)`.

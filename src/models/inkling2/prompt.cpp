@@ -557,8 +557,42 @@ private:
         const int on_peer = peer ? peer_send(w, l, rows) : 0;   // the second card's rows run beside the main card's
         if (w.slot_map) {   // a layer with experts in RAM (spill.hpp): its pairs by slot (the second card's left out), its RAM experts copied into the staging
             remap_ids(b().ids, pairs, peer ? w.slot_map : w.slot_full, strm());
-            const uint64_t kept = (uint64_t) (g_.n_expert - w.n_spill) * w.expert_stride;
-            if (!m_.stage_from_card(l, strm(), !peer))   // the elastic spill's card copies when the layer has them all
+            const int ne = g_.n_expert, kept_slots = ne - w.n_spill;
+            const uint64_t kept = (uint64_t) kept_slots * w.expert_stride;
+            // [609] A short chunk reads a handful of the layer's RAM experts, so staging all of them copies ~15 GB over the
+            // host link for a prompt read - the flat ~1.8 s of time to first token. Stage only the slots its rows route to:
+            // the pairs were just remapped, so `ids` holds slot indices. A long chunk (over 1,024 rows) reads most slots and
+            // keeps the every-slot copy, as does the peer path, whose mask spans two cards' slots.
+            bool staged = false;
+            if (!peer && rows <= 1024 && w.n_spill > 0) {
+                std::vector<int32_t> ids((size_t) pairs);
+                cudaStreamSynchronize(strm());
+                cudaMemcpy(ids.data(), b().ids, ids.size() * 4, cudaMemcpyDeviceToHost);
+                std::vector<uint8_t> want((size_t) w.n_spill, 0), card((size_t) w.n_spill, 0);
+                std::vector<const void*> copy((size_t) w.n_spill, nullptr);
+                const int32_t* slot = m_.slots_of(l);
+                for (int e = 0; e < ne; ++e) {
+                    const int s = slot[e];
+                    if (s < kept_slots) continue;   // a kept expert: its own memory, already in place
+                    copy[(size_t) (s - kept_slots)] = m_.copy_of(l, e);
+                    card[(size_t) (s - kept_slots)] = m_.copy_of(l, e) != nullptr;
+                }
+                for (const int32_t s : ids)
+                    if (s >= kept_slots && s < ne) want[(size_t) (s - kept_slots)] = 1;
+                uint8_t* base = w.experts + kept;
+                for (const StageOp& op : stage_plan(w.n_spill, card.data(), want.data(), kept_slots > 0)) {
+                    uint8_t* dst = base + (uint64_t) op.slot * w.expert_stride;
+                    if (op.kind == StageOp::Card)
+                        cudaMemcpyAsync(dst, copy[(size_t) op.slot], w.expert_stride, cudaMemcpyDeviceToDevice, strm());
+                    else if (op.kind == StageOp::Ram)
+                        cudaMemcpyAsync(dst, w.spill_host + (uint64_t) op.slot * w.expert_stride,
+                                        (size_t) op.n * w.expert_stride, cudaMemcpyHostToDevice, strm());
+                    else
+                        cudaMemsetAsync(dst, 0, kSlotGuard, strm());
+                }
+                staged = true;
+            }
+            if (!staged && !m_.stage_from_card(l, strm(), !peer))   // the elastic spill's card copies when the layer has them all
                 cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) m_.ram_n(l) * w.expert_stride, cudaMemcpyHostToDevice, strm());
             cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
         }
