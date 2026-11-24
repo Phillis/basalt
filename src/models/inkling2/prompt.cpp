@@ -498,6 +498,7 @@ private:
         ap.cap = c.ring ? kChunk : c.cap;
         ap.fp8 = fp8;
         ap.int8 = int8;
+        ap.v4 = m_.cache_v4();   // [V4] the writer must lay the value rows out as the readers see them
         ap.q = b().q;
         ap.r = b().r;
         ap.sink = b().sink;
