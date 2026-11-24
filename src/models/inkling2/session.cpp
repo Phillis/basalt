@@ -56,6 +56,10 @@ namespace {
 
 namespace bk = basalt::kernels;
 
+// [local] A prompt read stages every spilled layer's RAM experts over the host link - about 15 GB for this plan - so a
+// short prompt pays ~1.8 s of time to first token whatever its length (measured: 33 tokens at 1.8 s through the prompt
+// path). Below this many rows the decode path reads it instead, eight rows a forward, and stays in the resident experts.
+constexpr int kPromptPathMin = 96;   // was 16
 constexpr int kMaxRows = kDecodeRows;    // rows of one forward call (a decode window, a step of a prompt)
 constexpr int kTypeBF16 = 30;
 constexpr int kOutRows = 3072;           // the attention output's width (heads x head width)
@@ -463,7 +467,7 @@ public:
         if (r.pos == 0) restart_positions(r.n_tokens);
         if (std::string e; !ensure_positions(r.pos + r.n_tokens, e)) return {model::Status::Refused, "inkling2: " + e};
         hist_.resize((size_t) r.pos);
-        if (sh_->prompt && r.n_tokens > 16) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
+        if (sh_->prompt && r.n_tokens > kPromptPathMin) return sh_->prompt->read(r, hist_, vc_, dspark_, stream_);   // PROMPT HOOK
         std::string err;
         if (!admit(err)) return {model::Status::Error, "inkling2: " + err};
         const Admitted held{*this};
