@@ -9,7 +9,7 @@
             "kv": "fp8v4",
             "parallel": 2,
             "vision": "off",
-            "vram-reserve-mib": 512,
+            "vram-reserve-mib": 256,
             "ram-reserve-mib": 512,
             "expert-cache": "auto",
             "spec": 8,
