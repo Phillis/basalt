@@ -1,4 +1,4 @@
-﻿# P0-2 investigation: the prompt loan at two sessions
+# P0-2 investigation: the prompt loan at two sessions
 
 The spec's `P0-2` calls the loan "the largest decode lever": alone, copies rebalance every 256 kept rows and a
 prompt's loan lifts them from 1,034 to about 1,400-1,600, and the hit rate is 93%; at two slots both are switched

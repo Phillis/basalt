@@ -153,3 +153,21 @@ baseline read from NULL; see `P0-2-LOAN-INVESTIGATION.md`). Effect at 2 x 128k, 
 | prefill during the other slot's decode | 953-1,048 t/s per stream |
 | stress gate | 20/20 rounds, one process, no crashes |
 | single 86k prompt | fails: "the caches cannot grow to 90112 positions: the array is full" (P0-4) |
+## The context curve at two slots (2 x 128k config, fill ramped, one clean run per depth)
+
+Measured on 0aa1d2b6 (the K/V cell-size fix, without which nothing above ~82k worked at two slots), chunk 5,120,
+reserve 256 MiB, both slots fed unique text at the same depth:
+
+| depth per slot | prefill per stream | decode per stream (400 tokens) | aggregate decode |
+|---|---|---|---|
+| 30k | 1,705 t/s | 46.2 tok/s | 92.4 |
+| 64k | 1,500 t/s | 44.9 tok/s | 89.8 |
+| 96k | 1,315 t/s | 43.3 tok/s | 86.6 |
+| 120k | 1,190 t/s | 43.3 tok/s | 86.6 |
+
+So at the depths an agent session actually reaches, two slots give **~43-46 tok/s per stream with both decoding**
+and **1,190-1,705 t/s per stream while reading**, and 120k per slot is real - the elastic caches take the expert
+copies as they fill, which is why decode eases from 46 to 43 rather than collapsing. Before the cell-size fix the
+second slot could not pass 82k at all.
+
+Text under 128k is the band that matters (pi compacts somewhere below it); 64k-110k is the plateau.
