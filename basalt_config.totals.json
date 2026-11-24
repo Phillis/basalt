@@ -1,0 +1,14 @@
+{
+  "since": 1795491128,
+  "requests": 542,
+  "prompt": 1994388,
+  "reused": 33532,
+  "written": 106029,
+  "prompt_ms": 1612565.9000000001,
+  "decode_ms": 1588775.9000000004,
+  "cost_input_per_million": 0,
+  "cost_output_per_million": 0,
+  "cost_cache_write_per_million": null,
+  "cost_cache_hit_per_million": null,
+  "cost_usd": 0.0
+}

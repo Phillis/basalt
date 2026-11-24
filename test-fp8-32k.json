@@ -1,0 +1,26 @@
+{
+    "version":  2,
+    "models":  [
+                   {
+                       "alias":  "Inkling-2-Mini",
+                       "model":  "C:/LLM/Basalt/models/Inkling-2-Mini-NVFP4.basalt",
+                       "gpu":  "0",
+                       "max-context": 32768,
+                       "kv":  "fp8",
+                       "parallel": 1,
+                       "vision":  "off",
+                       "vram-reserve-mib": 768,
+                       "ram-reserve-mib":  512,
+                       "expert-cache":  "auto",
+                       "spec":  1,
+                       "prompt-cache":  6,
+                       "reasoning-effort":  "medium"
+                   }
+               ],
+    "server":  {
+                   "host":  "0.0.0.0",
+                   "port":  8080,
+                   "open":  false,
+                   "allowed-host":  "*"
+               }
+}

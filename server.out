@@ -1,0 +1,149 @@
+[server] legend   pp=prompt read  tg=generation  c=cached  acc=drafts accepted  dl=tokens per window  hit=expert cache  pcie=routed experts over PCIe
+[server] Inkling-2-Mini  ctx=262144 kv=fp8v4 reserve=768MiB ram-reserve=512MiB expert-cache=auto prompt-cache=6 spec=8 temp=1.0
+[server] engine log: C:\Users\Phil\.cache\basalt\eb691302953ae8a7\engine.log
+[server] warning  Host check off, any name is accepted (--allowed-host *)
+[server] totals   persistent, C:\LLM\rebase\b\basalt_config.totals.json
+[server] ready    http://127.0.0.1:8080/v1  openai+anthropic  stats http://127.0.0.1:8080/ api-key=on
+[server] network  http://192.168.11.214:8080/v1
+[server] network  http://100.67.244.54:8080/v1
+[server] network  http://172.23.32.1:8080/v1
+[server] planning weight allocation
+[server] placed   cuda0 2.7GiB 1.6s
+[server] placed   ram 12.5GiB 3.0s
+[server] loaded   15.2GiB 4.3s  cuda0=2.7GiB ram=12.5GiB
+[server] weights  loaded, ctx=262144 images=off
+[server] thinking budget 160 tokens, output cap 320 (answer-room auto)
+[server] live | s1 tg=53/320 81.2t/s | total 81t/s
+[server] thinking budget reached (160 tokens), wrapping up
+[server] live | s1 tg=168/320 63.0t/s | total 63t/s
+[server] s1 done  pp=32/0c 0.3s  tg=320 107.1t/s acc=88% dl=2.9  ttft=0.4s  end=length  hit=91.0%  pcie=0.0%
+[server] thinking budget 160 tokens, output cap 320 (answer-room auto)
+[server] live | s1 tg=87/320 110.1t/s | total 110t/s
+[server] thinking budget reached (160 tokens), wrapping up
+[server] live | s1 tg=172/320 61.2t/s | total 61t/s
+[server] s1 done  pp=29/0c 0.2s  tg=320 95.5t/s acc=80% dl=2.1  ttft=0.2s  end=length  hit=90.0%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 160 tokens, output cap 320 (answer-room auto)
+[server] live | s1 tg=1/320 | total 0t/s
+[server] s1 done  pp=2585/0c 2.2s 1164t/s  tg=83 68.1t/s acc=63% dl=1.8  ttft=2.3s  end=stop  hit=85.0%  pcie=0.0%
+[server] thinking budget 45 tokens, output cap 90 (answer-room auto)
+[server] thinking budget reached (45 tokens), wrapping up
+[server] live | s1 tg=52/90 63.8t/s | total 64t/s
+[server] s1 done  pp=22/0c 0.2s  tg=53 100.8t/s acc=100% dl=1.9  ttft=0.2s  end=stop  hit=87.5%  pcie=0.0%
+[server] thinking budget 45 tokens, output cap 90 (answer-room auto)
+[server] thinking budget reached (45 tokens), wrapping up
+[server] s1 done  pp=22/0c 0.2s  tg=58 115.7t/s acc=100% dl=2.2  ttft=0.2s  end=stop  hit=88.6%  pcie=0.0%
+[server] thinking budget 45 tokens, output cap 90 (answer-room auto)
+[server] thinking budget reached (45 tokens), wrapping up
+[server] live | s1 tg=58/90 71.3t/s | total 71t/s
+[server] s1 done  pp=24/0c 0.2s  tg=69 119.6t/s acc=100% dl=2.4  ttft=0.2s  end=stop  hit=91.3%  pcie=0.0%
+[server] thinking budget 45 tokens, output cap 90 (answer-room auto)
+[server] thinking budget reached (45 tokens), wrapping up
+[server] s1 done  pp=22/0c 0.2s  tg=53 108.5t/s acc=100% dl=1.9  ttft=0.2s  end=stop  hit=88.7%  pcie=0.0%
+[server] thinking budget 45 tokens, output cap 90 (answer-room auto)
+[server] thinking budget reached (45 tokens), wrapping up
+[server] s1 done  pp=22/0c 0.2s  tg=57 124.6t/s acc=64% dl=2.3  ttft=0.2s  end=stop  hit=90.4%  pcie=0.0%
+[server] thinking budget 30 tokens, output cap 60 (answer-room auto)
+[server] thinking budget reached (30 tokens), wrapping up
+[server] s1 done  pp=15/0c 0.3s  tg=60 99.5t/s acc=64% dl=1.8  ttft=0.3s  end=length  hit=88.9%  pcie=0.0%
+[server] thinking budget 30 tokens, output cap 60 (answer-room auto)
+[server] thinking budget reached (30 tokens), wrapping up
+[server] s1 done  pp=15/14c 0.0s  tg=60 109.7t/s acc=58% dl=1.8  ttft=0.0s  end=length  hit=88.7%  pcie=0.0%
+[server] thinking budget 30 tokens, output cap 60 (answer-room auto)
+[server] thinking budget reached (30 tokens), wrapping up
+[server] s1 done  pp=15/14c 0.0s  tg=60 107.0t/s acc=58% dl=1.8  ttft=0.0s  end=length  hit=88.7%  pcie=0.0%
+[server] thinking budget 30 tokens, output cap 60 (answer-room auto)
+[server] thinking budget reached (30 tokens), wrapping up
+[server] s1 done  pp=15/14c 0.0s  tg=60 107.7t/s acc=56% dl=1.8  ttft=0.0s  end=length  hit=88.8%  pcie=0.0%
+[server] thinking budget 40 tokens, output cap 80 (answer-room auto)
+[server] live | s1 tg=1/80 | total 0t/s
+[server] thinking budget reached (40 tokens), wrapping up
+[server] s1 done  pp=872/14c 1.3s 685t/s  tg=48 68.6t/s acc=80% dl=2.2  ttft=1.3s  end=stop  hit=89.3%  pcie=0.0%
+[server] thinking budget 40 tokens, output cap 80 (answer-room auto)
+[server] live | s1 tg=1/80 | total 0t/s
+[server] thinking budget reached (40 tokens), wrapping up
+[server] s1 done  pp=1634/14c 2.1s 789t/s  tg=49 73.9t/s acc=62% dl=1.9  ttft=2.1s  end=stop  hit=89.6%  pcie=0.0%
+[server] thinking budget 40 tokens, output cap 80 (answer-room auto)
+[server] live | s1 tg=1/80 | total 0t/s
+[server] thinking budget reached (40 tokens), wrapping up
+[server] s1 done  pp=3971/14c 2.4s 1617t/s  tg=49 76.1t/s acc=50% dl=2.0  ttft=2.5s  end=stop  hit=91.4%  pcie=0.0%
+[server] thinking budget 40 tokens, output cap 80 (answer-room auto)
+[server] s1 read  pp=7856/70585 1282t/s 6s
+[server] s1 read  pp=15698/70585 1390t/s 11s
+[server] s1 read  pp=23540/70585 1406t/s 17s
+[server] s1 read  pp=31382/70585 1398t/s 22s
+[server] s1 read  pp=39224/70585 1381t/s 28s
+[server] s1 read  pp=47066/70585 1359t/s 35s
+[server] s1 read  pp=54908/70585 1338t/s 41s
+[server] s1 read  pp=62750/70585 1317t/s 48s
+[server] s1 read  pp=70584/70585 1331t/s 53s
+[server] thinking budget reached (40 tokens), wrapping up
+[server] live | s1 tg=42/80 26.4t/s | total 26t/s
+[server] s1 done  pp=70585/14c 53.0s 1331t/s  tg=80 49.9t/s acc=69% dl=2.5  ttft=53.1s  end=length  hit=94.4%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 160 tokens, output cap 320 (answer-room auto)
+[server] live | s1 tg=71/320 96.9t/s | total 97t/s
+[server] thinking budget reached (160 tokens), wrapping up
+[server] live | s1 tg=162/320 55.1t/s | total 55t/s
+[server] s1 done  pp=29/14c 0.3s  tg=320 89.4t/s acc=76% dl=2.0  ttft=0.3s  end=length  hit=89.9%  pcie=0.0%
+[server] s1 read  pp=7708/15403 1268t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15403/14c 10.1s 1528t/s  tg=4 46.3t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=81.1%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] s1 read  pp=7690/15365 1263t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15365/14c 10.1s 1520t/s  tg=4 48.0t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=80.7%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] s1 read  pp=7732/15451 1276t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15451/14c 10.1s 1534t/s  tg=4 48.4t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=81.3%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 160 tokens, output cap 320 (answer-room auto)
+[server] live | s1 tg=57/320 82.3t/s | total 82t/s
+[server] thinking budget reached (160 tokens), wrapping up
+[server] live | s1 tg=265/320 97.1t/s | total 97t/s
+[server] s1 done  pp=29/14c 0.3s  tg=320 95.7t/s acc=72% dl=1.9  ttft=0.3s  end=length  hit=82.7%  pcie=0.0%
+[server] s1 read  pp=7744/15473 1262t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15473/14c 10.1s 1524t/s  tg=4 46.3t/s acc=100% dl=2.0  ttft=10.2s  end=length  hit=78.7%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] s1 read  pp=7708/15403 1265t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15403/14c 10.1s 1525t/s  tg=4 42.5t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=79.2%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] s1 read  pp=7716/15416 1269t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15416/14c 10.1s 1528t/s  tg=4 45.4t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=78.9%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 160 tokens, output cap 320 (answer-room auto)
+[server] live | s1 tg=59/320 85.1t/s | total 85t/s
+[server] thinking budget reached (160 tokens), wrapping up
+[server] live | s1 tg=257/320 93.8t/s | total 94t/s
+[server] s1 done  pp=29/14c 0.3s  tg=320 103.2t/s acc=87% dl=2.2  ttft=0.3s  end=length  hit=84.6%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] s1 read  pp=7744/15473 1271t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15473/14c 10.1s 1532t/s  tg=4 45.4t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=77.9%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 200 tokens, output cap 400 (answer-room auto)
+[server] live | s1 tg=168/400 89.1t/s | total 89t/s
+[server] thinking budget reached (200 tokens), wrapping up
+[server] live | s1 tg=277/400 67.2t/s | total 67t/s
+[server] s1 done  pp=25/14c 0.1s  tg=400 98.1t/s acc=77% dl=1.8  ttft=0.1s  end=length  hit=92.0%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] s1 read  pp=7706/15399 1263t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15399/14c 10.1s 1521t/s  tg=4 30.1t/s acc=100% dl=1.3  ttft=10.2s  end=length  hit=77.5%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 200 tokens, output cap 400 (answer-room auto)
+[server] live | s1 tg=163/400 85.9t/s | total 86t/s
+[server] thinking budget reached (200 tokens), wrapping up
+[server] s1 done  pp=25/14c 0.1s  tg=203 85.4t/s  ttft=0.1s  end=stop  hit=71.4%  pcie=0.0%
+[server] s1 read  pp=7712/15408 1267t/s 6s
+[server] live | s1 tg=1/4 | total 0t/s
+[server] s1 done  pp=15408/14c 10.1s 1526t/s  tg=4 43.8t/s acc=100% dl=2.0  ttft=10.1s  end=length  hit=73.8%  pcie=0.0%
+[server] warning: max tokens reached while thinking, no answer (set reasoning_budget_tokens, or start with --reasoning-budget-tokens)
+[server] thinking budget 200 tokens, output cap 400 (answer-room auto)
+[server] live | s1 tg=173/400 90.9t/s | total 91t/s
+[server] thinking budget reached (200 tokens), wrapping up
+[server] s1 done  pp=25/14c 0.1s  tg=203 89.3t/s  ttft=0.1s  end=stop  hit=70.8%  pcie=0.0%
