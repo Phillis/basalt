@@ -89,3 +89,40 @@ That narrows the search to the sleep recall and the state it leaves (`lent_`, `l
 each layer's `blob_table`), with another session's request able to start in between. Instrument exactly that
 transition - but from a build that can be symbolized (`RelWithDebInfo` + PDB first): five blind attempts have now
 been spent on hypotheses the log alone could not rank.
+## Symbolization attempt (per the review session), and where it stopped
+
+Cheapest route tried - relink with `/MAP:basalt.map`, print `GetModuleHandleW(nullptr)` from the crash handler,
+symbolize `frame - base` against the map:
+
+- the handler now prints `basalt crash: module base: 0x7ff747290000` and 24 frames;
+- the map the linker produced is **871 KB with 4,991 symbols** - public symbols only, no file-local statics - and
+  the nearest symbol for the faulting RVA came out as a header artefact (`__guard_flags`), so the top frame is
+  not resolvable this way. The `/MAP` flag also truncated `bin\basalt.exe` once (LNK1104 on the map) and had to
+  be removed from the cache and relinked.
+
+The working route is the fallback: a `RelWithDebInfo` tree in its own build directory plus
+`SymInitialize`/`SymFromAddr` in the handler (dbghelp ships with Windows).
+
+## The strongest lead, from the review session's reading of the fault
+
+`0x16E0 = 732 * 8` and `0x1708 = 737 * 8`: an **8-byte array indexed from a NULL base**. In the loan code that
+shape is `loan_addr_[loan_list_.size()]` in `publish_loan()` (an `unsigned long long*` from `cudaHostAlloc`) or
+`copy_[pair]` (a `std::vector<const void*>`, also 8 bytes an entry). 732-737 is a plausible count of loaned pairs.
+So the fault most likely is **`publish_loan()` running with `loan_addr_` (or `copy_`) null**.
+
+Two ways that happens, both worth checking first next time:
+
+1. `loan_ready()` allocates `loan_addr_` and is only ever entered when `loan_state_ == 0`; after any path that
+   leaves `loan_state_ == 1` with `loan_addr_` freed or never set (the `~Prompt`/`set_prompt_arena(nullptr, 0)`
+   teardown of the *other* session, and the model's own release path), `submit_loan` still passes its guard
+   (`loan_state_ == 1 && loan_arena_`) while `loan_addr_` is null.
+2. `copy_` is sized by the copy machinery; `publish_loan` indexes it before its first `if (copy_[pair])`.
+
+Also from that reading, a real ordering bug independent of the crash: **`publish_loan` writes the blob-table
+entries on the publishing session's stream and returns without syncing**, while `recall_loan` zeroes them on the
+recalling session's stream; nothing orders a *reader* after a publish. `join_placement` covers the recall only.
+That should be fixed regardless (`cudaStreamSynchronize` after the publish, or a publication event the readers
+wait on).
+
+**P0-2 is parked with the loan single-session**, per the review session's rule: the trace did not name the fault
+inside the time box.
