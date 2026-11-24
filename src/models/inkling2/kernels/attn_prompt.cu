@@ -56,6 +56,19 @@ void check(const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("inkling2 ") + what + ": " + cudaGetErrorString(e));
 }
 
+// [V4] The code set: E2M1 - 0, .5, 1, 1.5, 2, 3, 4, 6 and their negatives (the NVFP4 one). A linear four-bit code spends
+// a heavy row's step on its largest value; these do not.
+__device__ __forceinline__ float v4_e2m1_mag(int i) {
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+__device__ __forceinline__ int v4_e2m1_code(float x) {   // nearest code; bit 3 is the sign
+    const float a = fabsf(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}__device__ __forceinline__ float v4_e2m1_value(int code) {
+    const float m = v4_e2m1_mag(code & 7);
+    return (code & 8) ? -m : m;
+}
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x2(unsigned& r0, unsigned& r1, const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(smem_u32(p)));
@@ -103,8 +116,7 @@ __device__ __forceinline__ void v4x16_to_h8(const uint2 u, float scale, uint32_t
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
-            const __half2 hv = __floats2half2_rn((float) (lo >= 8 ? lo - 16 : lo) * scale,
-                                                 (float) (hi >= 8 ? hi - 16 : hi) * scale);
+            const __half2 hv = __floats2half2_rn(v4_e2m1_value(lo) * scale, v4_e2m1_value(hi) * scale);
             h[4 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);   // four half2 a word
         }
 }

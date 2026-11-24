@@ -127,6 +127,16 @@ double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 // ---- attention -----------------------------------------------------------------------------------------------------------
 
 // The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8).
+// [V4] the E2M1 code set, as the kernels carry it
+static float v4_mag(int i) {
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+static int v4_code(float x) {
+    const float a = std::fabs(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}
+static float v4_value(int code) { return (code & 8 ? -1.f : 1.f) * v4_mag(code & 7); }
 enum Kv { kF16, kE4M3, kI8, kV4 };   // kV4: E4M3 keys with four-bit values
 size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3 || kv == kV4, kv == kI8); }   // a key row
 size_t kv_v_bytes(Kv kv) { return kv == kV4 ? (size_t) kKvV4RowBytes : kv_bytes(kv); }                 // a value row
@@ -139,14 +149,14 @@ void put_row(Kv f0, const float* x, uint8_t* row, double* got, bool values = fal
         for (int grp = 0; grp < kKvV4Groups; ++grp) {
             float m = 0.f;
             for (int d = grp * kKvV4Group; d < (grp + 1) * kKvV4Group; ++d) m = std::max(m, std::fabs(x[d]));
-            const uint16_t sh = f2h(m / (float) kKvV4CodeMax);
+            const uint16_t sh = f2h(m / kV4CodeMaxMag);
             const float sc = (float) h2d(sh);
             std::memcpy(row + kKvV4CodeBytes + 2 * grp, &sh, 2);
             for (int d = grp * kKvV4Group; d < (grp + 1) * kKvV4Group; ++d) {
-                const int q = sc > 0.f ? std::clamp((int) std::nearbyint(x[d] / sc), (int) kKvV4CodeMin, (int) kKvV4CodeMax) : 0;
+                const int q = v4_code(sc > 0.f ? x[d] / sc : 0.f);
                 const uint8_t prev = row[d / 2];
                 row[d / 2] = (d & 1) ? (uint8_t) ((prev & 0x0F) | ((q & 0xF) << 4)) : (uint8_t) ((prev & 0xF0) | (q & 0xF));
-                got[d] = (double) ((float) q * sc);
+                got[d] = (double) (v4_value(q) * sc);
             }
         }
         return;

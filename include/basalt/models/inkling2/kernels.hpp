@@ -28,6 +28,7 @@ constexpr int kKvV4Groups = kHeadDim / kKvV4Group;              ///< scales a ro
 constexpr int kKvV4CodeBytes = kHeadDim / 2;                    ///< two 4-bit codes a byte
 constexpr int kKvV4RowBytes = (kKvV4CodeBytes + 2 * kKvV4Groups + 15) & ~15;   ///< codes, scales, then zero pad to 16 bytes: 80
 constexpr int kKvV4CodeMin = -8, kKvV4CodeMax = 7;              ///< a four-bit two's complement code
+constexpr float kV4CodeMaxMag = 6.f;                          ///< [V4] the largest magnitude an E2M1 code carries, in group scales
 // [V4] A value row's bytes for a cache format: the compressed row when v4, else the key's own format.
 constexpr int kv_v_row_bytes(bool fp8, bool int8, bool v4) { return v4 ? kKvV4RowBytes : kv_cache_row_bytes(fp8, int8); }
 // [V4] What one position costs across K and V.

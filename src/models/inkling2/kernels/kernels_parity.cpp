@@ -342,6 +342,16 @@ void test_prepare() {
     }
 }
 
+// [V4] the E2M1 code set, as the kernels carry it
+static float v4_mag(int i) {
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+static int v4_code(float x) {
+    const float a = std::fabs(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}
+static float v4_value(int code) { return (code & 8 ? -1.f : 1.f) * v4_mag(code & 7); }
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 void test_attention() {
@@ -385,20 +395,18 @@ void test_attention() {
                         float amax = 0.f;
                         for (int i = 0; i < kKvV4Group; ++i)
                             amax = std::max(amax, std::fabs((float) vd[base + gi * kKvV4Group + i]));
-                        const float s = amax / (float) kKvV4CodeMax;
+                        const float s = amax / kV4CodeMaxMag;
                         reinterpret_cast<__half*>(row + kKvV4CodeBytes)[gi] = __float2half_rn(s);
                         for (int i = 0; i < kKvV4Group; i += 2) {
-                            int lo = s > 0.f ? (int) std::lround((float) vd[base + gi * kKvV4Group + i] / s) : 0;
-                            int hi = s > 0.f ? (int) std::lround((float) vd[base + gi * kKvV4Group + i + 1] / s) : 0;
-                            lo = std::min(kKvV4CodeMax, std::max(kKvV4CodeMin, lo));
-                            hi = std::min(kKvV4CodeMax, std::max(kKvV4CodeMin, hi));
+                            const int lo = v4_code(s > 0.f ? (float) vd[base + gi * kKvV4Group + i] / s : 0.f);
+                            const int hi = v4_code(s > 0.f ? (float) vd[base + gi * kKvV4Group + i + 1] / s : 0.f);
                             row[(gi * kKvV4Group + i) / 2] = (uint8_t) ((lo & 0xF) | ((hi & 0xF) << 4));
                         }
                     }
                     for (int i = 0; i < kHeadDim; ++i) {   // the reference reads the codes back
                         const int code = (row[i / 2] >> ((i & 1) ? 4 : 0)) & 0xF;
                         const float s = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[i / kKvV4Group]);
-                        vd[base + i] = (double) ((float) (code >= 8 ? code - 16 : code) * s);
+                        vd[base + i] = (double) (v4_value(code) * s);
                     }
                 }
         }
@@ -1207,13 +1215,14 @@ void test_prepare_v4() {
             for (int d = 0; d < kHeadDim; ++d) {
                 const int code = (row[d / 2] >> ((d & 1) ? 4 : 0)) & 0xF;
                 const float s = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[d / kKvV4Group]);
-                const double got = (double) ((float) (code >= 8 ? code - 16 : code) * s);
-                const double want = val[d] * f;
+                const double got = (double) (v4_value(code) * s);
+                const int q = v4_code(s > 0.f ? (float) (val[d] * f) / s : 0.f);   // the code the writer must choose
+                const double want = (double) (v4_value(q) * s);
                 const double err = std::fabs(got - want);
                 worst = std::max(worst, err);
                 worst_step = std::max(worst_step, err / (s > 0 ? (double) s : 1.0));
                 ++codes;
-                if (err > (s > 0 ? (double) s : 1.0) * 0.5 + 1e-6) ++bad;
+                if (err > 1e-6 * std::fabs(want) + 1e-9) ++bad;   // the same code, hence the same value
             }
         }
     const bool ok = bad == 0;
