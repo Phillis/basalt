@@ -20,3 +20,6 @@ server.err
 fg.out
 fg.err
 
+basalt_config.totals.json
+test-v4.totals.json
+
