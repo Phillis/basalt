@@ -463,6 +463,9 @@ public:
         for (int i = 0; i < n; ++i) {
             Session& s = *static_cast<Session*>(sessions[i]);
             if (s.win_rows_ > 0) s.fold_rows(std::clamp(kept[i] - s.win_off_, 0, s.win_rows_));
+            // the batch path never went through decode_window(), so nothing armed the loan or rebalanced between rounds:
+            // with two sessions both decode through here and the loan stayed off after the first recall
+            if (!s.pump_placement(s.win_pos_ + s.win_off_ + s.win_rows_)) return wedged();
             for (const BatchSeg& b : batch_segs_)   // a batch's: on this session, its leader
                 if (b.s == &s) fold_rows(std::clamp(kept[i], 0, b.rows), nullptr, b.row0);
         }
@@ -796,9 +799,13 @@ public:
         // only once no copy is left: the reserve is the copies' target, not a floor the caches stop at)
         const int64_t before = m_.card_copies();
         const auto make_room = [&] {   // false: a demote failed (the model is wedged then)
-            if (give_back(grow + keep_free, [&] { return m_.room(); }, [&] { return m_.promoted(); },
-                          [&](uint64_t b, uint64_t& freed) { return feed_heat() && m_.demote(b, freed); }))
-                return true;
+            const auto back = [&] {
+                return give_back(grow + keep_free, [&] { return m_.room(); }, [&] { return m_.promoted(); },
+                                  [&](uint64_t b, uint64_t& freed) { return feed_heat() && m_.demote(b, freed); });
+            };
+            if (back()) return true;
+            // the loan's copies are pure cache in the arena: recall them and try once more before the grow fails
+            if (m_.loaned() > 0 && recall_loan(-1) && back()) return true;
             err = "the caches cannot grow: the expert copies could not go back to RAM";
             return false;
         };
@@ -905,7 +912,9 @@ public:
         return true;
     }
     // One session alone with its copies: they follow its lookups between windows too.
-    bool rebalances() const { return m_.elastic() && !m_.lent() && m_.promoted() > 0 && sh_.use_count() == 1; }
+    // With several sessions one copy set serves them all: a placement change joins every reader (join_placement), and it
+    // is applied only at a window boundary, so both sessions' windows run under the placement their position fixes.
+    bool rebalances() const { return m_.elastic() && !m_.lent() && m_.promoted() > 0; }
     int64_t next_rebalance_after(int64_t pos) const {
         int64_t at = next_rebalance_;
         if (at <= pos) at += ((pos - at) / kRebalanceRows + 1) * kRebalanceRows;
@@ -937,6 +946,17 @@ public:
         return true;
     }
     // `at`: the prompt's position (-1: a sleep)
+    // The batch path's turn at a round boundary: the placement changes the next position makes due (a rebalance every
+    // kRebalanceRows kept rows, the loan's publication), then the next bounded part of its upload. Mirrors what
+    // decode_window() does per window on the solo path.
+    bool pump_placement(int64_t pos) {
+        if (!heat_tally_) return true;
+        if (rebalances() && next_rebalance_ >= 0 && pos >= next_rebalance_) rebalance_copies(pos, false);
+        if (m_.wedged()) return false;
+        if (m_.loan_pending() && m_.loan_publish_at() >= 0 && pos >= m_.loan_publish_at() && !publish_loan(pos)) return false;
+        if (m_.wedged()) return false;
+        return m_.submit_loan(pos + kLoanLagRows);
+    }
     bool recall_loan(int64_t at) {
         if (m_.wedged()) return false;
         if (m_.loaned() > 0) {
