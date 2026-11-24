@@ -147,7 +147,7 @@ __device__ __forceinline__ void v4_scales(const float (&v)[4], float f, int lane
     for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
 #pragma unroll
     for (int m = 1; m < kLanesPerGroup; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
-    s[lane / kLanesPerGroup] = a / (float) kKvV4CodeMax;
+    s[lane / kLanesPerGroup] = __half2float(__float2half_rn(a / (float) kKvV4CodeMax));   // the fp16 value the row stores
 }
 __device__ __forceinline__ void store_v4(void* row, int lane, const float (&v)[4], const float (&s)[kKvV4Groups]) {
     const int idx0 = lane * 4;

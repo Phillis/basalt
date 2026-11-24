@@ -859,30 +859,45 @@ void test_attention_window() {
     const Case cases[] = {{true, 0, 1, kExtent + 8}, {true, 300, 3, kExtent + 8}, {true, 2900, 8, kExtent + 8},
                           {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096},
                           {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096}};   // 2 rows: one slice, a slice each, the ring before position 0
-    for (int fmt = 0; fmt < 3; ++fmt)
-        for (const Case& k : cases) {
+    for (int fmt = 0; fmt < 3; ++fmt)
+
+        for (const Case& k : cases) {
+
             const bool fp8 = fmt >= 1, v4 = fmt == 2;   // [V4] E4M3 keys with four-bit values
             const int R = k.R;
             std::vector<int> pos(R);
             for (int r = 0; r < R; ++r) pos[r] = k.p0 + r;
             const size_t n_kv = (size_t) kKvHeads * k.cap * kHeadDim, elem = fp8 ? 1 : 2;
-            std::vector<uint8_t> kc(n_kv * elem), vc(n_kv * elem);
-            if (v4) {
-                vc.assign((size_t) k.cap * kKvHeads * kKvV4RowBytes, 0);
-                for (int64_t cell = 0; cell < k.cap; ++cell)
-                    for (int h = 0; h < kKvHeads; ++h) {
-                        uint8_t* row = &vc[((size_t) cell * kKvHeads + h) * kKvV4RowBytes];
-                        for (int b = 0; b < kKvV4CodeBytes; ++b) row[b] = (uint8_t) (rng() & 0xFF);
-                        for (int gI = 0; gI < kKvV4Groups; ++gI)
-                            reinterpret_cast<__half*>(row + kKvV4CodeBytes)[gI] = __float2half_rn(0.01f + 0.02f * (float) (rng() & 0xFF) / 255.f);
-                    }
+            std::vector<uint8_t> kc(n_kv * elem), vc(n_kv * elem);
+
+            if (v4) {
+
+                vc.assign((size_t) k.cap * kKvHeads * kKvV4RowBytes, 0);
+
+                for (int64_t cell = 0; cell < k.cap; ++cell)
+
+                    for (int h = 0; h < kKvHeads; ++h) {
+
+                        uint8_t* row = &vc[((size_t) cell * kKvHeads + h) * kKvV4RowBytes];
+
+                        for (int b = 0; b < kKvV4CodeBytes; ++b) row[b] = (uint8_t) (rng() & 0xFF);
+
+                        for (int gI = 0; gI < kKvV4Groups; ++gI)
+
+                            reinterpret_cast<__half*>(row + kKvV4CodeBytes)[gI] = __float2half_rn(0.01f + 0.02f * (float) (rng() & 0xFF) / 255.f);
+
+                    }
+
             }
             for (size_t i = 0; i < n_kv; ++i) {
                 const float kf = randn(1, 0.6f)[0], vf = randn(1, 1.0f)[0];
-                if (fp8) {
-                    kc[i] = __nv_fp8_e4m3(kf).__x;
+                if (fp8) {
+
+                    kc[i] = __nv_fp8_e4m3(kf).__x;
+
                     if (!v4) vc[i] = __nv_fp8_e4m3(vf).__x;
-                } else {
+                } else {
+
                     const uint16_t a = f2h(kf), b = f2h(vf);
                     std::memcpy(&kc[2 * i], &a, 2);
                     std::memcpy(&vc[2 * i], &b, 2);
@@ -1132,6 +1147,73 @@ void test_cpu_merge() {
 
 }  // namespace
 
+
+// [V4] The writer's four-bit value rows: the decode prepare kernel's values against the reference, decoding the codes it
+// wrote. What this checks is the writer alone - each value within half a code's step of the reference, which is exact for
+// a correct scale, rounding and packing, and impossible if any of them slipped.
+void test_prepare_v4() {
+    const int R = 3, p0 = 9000;
+    const int64_t cap = 9100;
+    std::vector<int> pos(R);
+    for (int r = 0; r < R; ++r) pos[r] = p0 + r;
+    const std::vector<float> yq = randn((size_t) R * kProjQ, 1.5f), yk = randn((size_t) R * kProjKV, 2.0f),
+                             yv = randn((size_t) R * kProjKV, 0.6f);
+    const std::vector<float> kc = randn(1024 * kConv, 0.3f), vc = randn(1024 * kConv, 0.3f);
+    const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rs = randn(kHeads * kRel, 0.2f, 1.f);
+    const std::vector<float> kr = randn((size_t) kConvRing * 1024, 2.0f), vr = randn((size_t) kConvRing * 1024, 0.6f);
+    float *dyq = dev(yq), *dyk = dev(yk), *dyv = dev(yv), *dkc = dev(kc), *dvc = dev(vc), *dqs = dev(qs), *drs = dev(rs);
+    float *dkr = dev(kr), *dvr = dev(vr);
+    int* dpos = dev(pos);
+    uint16_t* kcache = zeros<uint16_t>((size_t) kKvHeads * cap * kHeadDim);            // fp16 keys
+    uint8_t* vcache = zeros<uint8_t>((size_t) kKvHeads * cap * kKvV4RowBytes);          // four-bit values
+    float *q = zeros<float>((size_t) R * kHeads * kHeadDim), *rr = zeros<float>((size_t) R * kHeads * kRel),
+          *sink = zeros<float>((size_t) R * kHeads);
+    AttnPrep a;
+    a.yq = dyq; a.yk = dyk; a.yv = dyv; a.pos = dpos; a.full = true; a.k_conv = dkc; a.v_conv = dvc;
+    a.q_scale = dqs; a.r_scale = drs;
+    a.k_ring = dkr; a.v_ring = dvr; a.k_cache = kcache; a.v_cache = vcache; a.cap = cap;
+    a.q = q; a.r = rr; a.sink = sink; a.v4 = true;
+    attn_prepare(a, R, nullptr);
+    cudaDeviceSynchronize();
+
+    const std::vector<uint8_t> hv = host(vcache, (size_t) kKvHeads * cap * kKvV4RowBytes);
+    double worst = 0, worst_step = 0;
+    long codes = 0, bad = 0;
+    for (int r = 0; r < R; ++r)
+        for (int h = 0; h < kKvHeads; ++h) {
+            std::vector<double> val(kHeadDim);
+            double ss = 0;
+            for (int d = 0; d < kHeadDim; ++d) {
+                const int c = h * kHeadDim + d;
+                double acc = 0;
+                for (int j = 0; j < kConv; ++j) {
+                    double tap = vc[(size_t) c * kConv + (kConv - 1 - j)];
+                    tap += yv[(size_t) r * kProjKV + kOffTaps + h * kConv + j];
+                    acc += tap * conv_input(yv, kProjKV, vr, 1024, pos, r, j, c);
+                }
+                val[d] = (acc + yv[(size_t) r * kProjKV + c]) / 3.0;   // full: / sqrt(9)
+                ss += val[d] * val[d];
+            }
+            const double f = 1.0 / std::sqrt(ss / kHeadDim + 1e-6);
+            const uint8_t* row = &hv[((size_t) (pos[r] % cap) * kKvHeads + h) * kKvV4RowBytes];
+            for (int d = 0; d < kHeadDim; ++d) {
+                const int code = (row[d / 2] >> ((d & 1) ? 4 : 0)) & 0xF;
+                const float s = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[d / kKvV4Group]);
+                const double got = (double) ((float) (code >= 8 ? code - 16 : code) * s);
+                const double want = val[d] * f;
+                const double err = std::fabs(got - want);
+                worst = std::max(worst, err);
+                worst_step = std::max(worst_step, err / (s > 0 ? (double) s : 1.0));
+                ++codes;
+                if (err > (s > 0 ? (double) s : 1.0) * 0.5 + 1e-6) ++bad;
+            }
+        }
+    const bool ok = bad == 0;
+    std::printf("%-46s %s  (%ld codes, worst %.4f = %.3f of a step)\\n",
+                "decode prepare values, four-bit", ok ? "ok" : "FAIL", codes, worst, worst_step);
+    failures += !ok;
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1140,7 +1222,8 @@ int main() {
     }
     test_mix();
     test_ctrl();
-    test_prepare();
+    test_prepare();
+    test_prepare_v4();
     test_attention();
     test_post_conv();
     test_experts();
