@@ -82,6 +82,9 @@ Flow Request::restore() {
     own_partial = false;
     own_partial_from0 = false;   // the slot holds a read that gave way (BYIELD)
     own_partial_chunk = 0;
+    // [diag] BASALT_DIAG_SLOT=1: what the slot held when the request took it (sb is cleared below)
+    int diag_cached = 0, diag_ids = 0, diag_checks = 0;
+    std::vector<int32_t> diag_held;
     if (in_slot) {
         slot_draft_out();
         solo_book = {std::move(runtime_.live), std::move(runtime_.live_imgs), runtime_.live_ok, runtime_.cvec_cached, std::move(runtime_.checks)};
@@ -102,6 +105,10 @@ Flow Request::restore() {
             own_partial_from0 = sb.partial_from0;
             own_partial_chunk = sb.partial_chunk;
         }
+        diag_cached = sb.cached ? 1 : 0;
+        diag_ids = (int) sb.ids.size();
+        diag_checks = (int) sb.checks.size();
+        diag_held = sb.ids;
         sb.cached = false;
         sb.partial = false;
         sb.checks.clear();
@@ -133,6 +140,15 @@ Flow Request::restore() {
                 resume = (int64_t) c.ids.size();
                 from_live = false;
             }
+    }
+    if (std::getenv("BASALT_DIAG_SLOT")) {   // [diag] the restore's verdict, and where the held ids stop matching
+        int mismatch = -1;
+        for (size_t i = 0; i < diag_held.size() && (int64_t) i < n; ++i)
+            if (diag_held[i] != ids32[i]) { mismatch = (int) i; break; }
+        std::printf("SLOTDIAG slot=%d cached=%d held=%d checks=%d live_ok=%d resume=%lld from_live=%d mismatch=%d prompt=%d\n",
+                    in_slot ? slot_b : -1, diag_cached, diag_ids, diag_checks, (int) runtime_.live_ok,
+                    (long long) resume, (int) from_live, mismatch, (int) n);
+        std::fflush(stdout);
     }
     // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a
     // source too - its sessions are copied back below, so only the new part is read
