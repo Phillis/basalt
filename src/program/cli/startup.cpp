@@ -78,6 +78,13 @@ void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
             if (const int64_t id = id_of(name); id >= 0) o.eos_ids.push_back(id);
     if (!o.turn_token_given) o.turn_token = id_of(names.turn);
     if (!names.reply_role.empty()) o.reply_role_token = id_of(names.reply_role);
+    // A pack that does not NAME its reply role may still carry the token: inkling2's template opens every assistant
+    // block with <|message_model|>, which is where the turn checkpoint belongs (the prefix the next request shares).
+    // Without it the only checkpoint sits at the last token, after the generation header, which no later turn repeats -
+    // and every agent turn re-read its whole context.
+    if (o.reply_role_token < 0)
+        for (const char* text : {"<|message_model|>", "<|start_header_id|>", "<|assistant|>"})
+            if (const int64_t id = id_of(text); id >= 0) { o.reply_role_token = id; break; }
     if (!o.image_pad_given) o.image_pad_id = id_of(names.image_pad);
     if (!names.video_pad.empty()) o.video_pad_id = id_of(names.video_pad);
 }

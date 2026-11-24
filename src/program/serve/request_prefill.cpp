@@ -33,9 +33,17 @@ Flow Request::read_prompt() {
     // chat renders the same history - but not always the same header or the thinking of this reply - so that
     // checkpoint is the one it reuses.
     turn_at = -1;
-    if (runtime_.o.prompt_cache > 0 && runtime_.o.turn_token >= 0)
+    // The boundary a later request shares is the one that starts the reply: for a template whose reply role opens the
+    // assistant's block (<|message_model|>) that is the last reply-role token, not the last user turn. Falling back to
+    // the turn token keeps every other model as it was.
+    const int64_t boundary = runtime_.o.reply_role_token >= 0 ? runtime_.o.reply_role_token : runtime_.o.turn_token;
+    if (runtime_.o.prompt_cache > 0 && boundary >= 0)
         for (int64_t i = n - 1; i > resume; --i)
-            if (ids[(size_t) i] == runtime_.o.turn_token) { turn_at = i; break; }
+            if (ids[(size_t) i] == boundary) { turn_at = i; break; }
+    if (std::getenv("BASALT_DIAG_SLOT"))
+        std::printf("BOUNDARY turn=%lld reply_role=%lld chosen=%lld at=%lld n=%lld\n",
+                    (long long) runtime_.o.turn_token, (long long) runtime_.o.reply_role_token, (long long) boundary,
+                    (long long) turn_at, (long long) n);
     // A model whose template puts its generation header after the conversation boundary keeps the boundary as the
     // turn's checkpoint (the prefix the NEXT request renders) and takes n - 1 in addition (see part_checkpoint), which
     // is what pass 1 of the same turn resumes from. Overwriting the boundary with n - 1 made the only checkpoint sit
