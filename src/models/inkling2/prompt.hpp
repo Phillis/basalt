@@ -1,4 +1,4 @@
-// src/models/inkling2/prompt.hpp - the prompt path of an Inkling 2 session: reads of more rows than a decode window, into
+﻿// src/models/inkling2/prompt.hpp - the prompt path of an Inkling 2 session: reads of more rows than a decode window, into
 // the session's caches.
 #pragma once
 
@@ -17,7 +17,7 @@ namespace basalt::models::inkling2 {
 class DsparkHook;
 
 /// The most rows one prompt chunk runs (the drafter's tap holds as many).
-constexpr int kPromptChunk = 4096;
+constexpr int kPromptChunk = 8192;
 
 class PromptRunner {
 public:
