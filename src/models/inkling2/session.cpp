@@ -747,7 +747,8 @@ public:
     // The positions every full-attention cache backs: the visits' and the drafter's full layers'.
     void count_backed() {
         backed_ = m_.context();
-        for (const auto& a : elastic_) backed_ = std::min(backed_, (int64_t) (a->backed() / cell_bytes()));
+        for (size_t i = 0; i < elastic_.size(); ++i)
+            backed_ = std::min(backed_, (int64_t) (elastic_[i]->backed() / cell_bytes_at(i)));
         if (dspark_.on() && !elastic_.empty()) backed_ = std::min(backed_, std::max<int64_t>(0, dspark_.backed_cells() - kDsBlock));
     }
 
@@ -756,6 +757,8 @@ public:
     // lowest ranked first. False when even without any copy there is no room.
 
     uint64_t v_cell_bytes() const { return (uint64_t) kKvHeads * v_row_bytes(); }   // [V4]
+    // The bytes a cell of the i-th elastic array takes: the arrays are K,V pairs per full visit
+    uint64_t cell_bytes_at(size_t i) const { return (i % 2 == 1) ? v_cell_bytes() : cell_bytes(); }
     static constexpr int64_t kElasticKvStep = 8192;
     static constexpr uint64_t kElasticKeep = 512ull << 20;   // free bytes a grow leaves (the driver, the graphs)
     // The copies' placement changes at positions the token stream fixes (window_limit): a rebalance every kRebalanceRows
@@ -821,11 +824,13 @@ public:
         uint64_t backing0 = backing_bytes();
         bool out_of_memory = false;   // the failure was the device lacking the memory, nothing left half done
         const auto map = [&] {
-            for (auto& a : elastic_)
-                if (!a->ensure(bytes, 0, err)) {
-                    out_of_memory = a->out_of_memory();
+            for (size_t i = 0; i < elastic_.size(); ++i) {
+                const uint64_t want = cell_bytes_at(i) * (uint64_t) target;
+                if (!elastic_[i]->ensure(want, 0, err)) {
+                    out_of_memory = elastic_[i]->out_of_memory();
                     return false;
                 }
+            }
             if (dspark_.ensure(target, err)) return true;   // DSPARK HOOK
             out_of_memory = dspark_.out_of_memory();
             return false;
@@ -866,7 +871,7 @@ public:
     // The device bytes the caches map to back `positions` positions (ensure_positions), the allocation rounding included.
     uint64_t grow_bytes(int64_t positions) const {
         uint64_t n = dspark_.grow_bytes(positions);   // DSPARK HOOK
-        for (const auto& a : elastic_) n += a->growth(cell_bytes() * (uint64_t) positions);
+        for (size_t i = 0; i < elastic_.size(); ++i) n += elastic_[i]->growth(cell_bytes_at(i) * (uint64_t) positions);
         return n;
     }
 
