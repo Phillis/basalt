@@ -36,7 +36,18 @@ namespace fp4 = basalt::prefill::fp4;
 namespace mxfp8 = basalt::prefill::mxfp8;
 namespace q8 = basalt::prefill::q8;
 
-constexpr int kChunk = kPromptChunk;       // rows of one chunk forward
+constexpr int kChunk = kPromptChunk;
+constexpr int kRoutedRows = 1024;   // a chunk this short stages only the slots its rows route to ([609])
+
+// [diag] BASALT_DIAG_PROMPT=1: the bytes the prompt path stages and how many visits it takes, so the split
+// between the host link and the card's compute is measured rather than estimated.
+namespace {
+struct PromptDiag {
+    uint64_t h2d = 0, d2d = 0, full = 0;
+    int visits = 0, ram_ops = 0, card_ops = 0, fulls = 0;
+    bool on = std::getenv("BASALT_DIAG_PROMPT") != nullptr;
+} g_pdiag;
+}       // rows of one chunk forward
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;
@@ -144,6 +155,10 @@ struct Lane {
     mmq::Context mmq;
     cudaStream_t stream = nullptr;
     cudaEvent_t hand = nullptr;   // behind the card's half of a crossing
+    // [609/91bdae93] the prompt staging's copy stream: a spilled layer's RAM experts are copied under the kernels before it,
+    // `freed` follows the products that read the staging (one allocation every spilled layer shares), `staged` the copies
+    cudaStream_t copy = nullptr;
+    cudaEvent_t freed = nullptr, staged = nullptr;
 };
 
 class Prompt final : public PromptRunner {
@@ -158,6 +173,10 @@ public:
             Lane& k = lane_[i];
             cudaSetDevice(k.device);
             if (k.hand) cudaEventDestroy(k.hand);
+            if (k.copy && cudaStreamSynchronize(k.copy) != cudaSuccess) {}
+            if (k.freed) cudaEventDestroy(k.freed);
+            if (k.staged) cudaEventDestroy(k.staged);
+            if (k.copy) cudaStreamDestroy(k.copy);
             if (i > 0 && k.stream) cudaStreamDestroy(k.stream);
             if (k.mem) cudaFree(k.mem);
         }
@@ -179,6 +198,22 @@ public:
                 err = "cannot create the prompt path's events";
                 return false;
             }
+        // the next spilled visit after each step (the staging is one allocation every spilled layer shares)
+        next_spill_.assign(walk_.steps.size(), -1);
+        for (int si = (int) walk_.steps.size() - 1; si >= 0; --si) {
+            next_spill_[(size_t) si] = first_spill_;
+            if (m_.layer(g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer).slot_map) first_spill_ = si;
+        }
+        if (first_spill_ >= 0 && m_.cards() == 1 && m_.peer_device() < 0) {
+            Lane& k = lane_[0];
+            if (cudaStreamCreateWithFlags(&k.copy, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&k.freed, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&k.staged, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                err = "cannot create the prompt staging's stream";
+                return false;
+            }
+        }
         for (int i = lanes() - 1; i >= 0; --i) {   // the first card's last: it stays current
             cur_ = i;
             lane_[i].device = lane_device(i);
@@ -348,6 +383,14 @@ private:
             if (!chunk(tokens ? tokens + t0 : nullptr, emb ? emb + (size_t) t0 * g_.n_embd : nullptr, rows, pos + t0, err))
                 return {model::Status::Error, "inkling2: " + err};
             ds_->note(pos + t0, rows);
+            if (g_pdiag.on) {
+                const double h2d = (double) g_pdiag.h2d, full = (double) g_pdiag.full, d2d = (double) g_pdiag.d2d;
+                log::info("basalt inkling2", "prompt diag: %d rows, %d visits, h2d %.2f GiB + full %.2f GiB, d2d %.2f GiB"
+                          " (h2d %.1f ms at 15.75 GB/s), %d ram ops, %d card ops, %d full copies",
+                          rows, g_pdiag.visits, h2d / 1073741824.0, full / 1073741824.0, d2d / 1073741824.0,
+                          (h2d + full) / 15.75e6, g_pdiag.ram_ops, g_pdiag.card_ops, g_pdiag.fulls);
+                g_pdiag = PromptDiag{};
+            }
             if (tokens) hist.insert(hist.end(), tokens + t0, tokens + t0 + rows);
             else hist.insert(hist.end(), (size_t) rows, pad);
             cudaEventRecord(done_[k % 2], strm());
@@ -358,6 +401,9 @@ private:
             reported = t0 + rows;
         }
         if (cudaStreamSynchronize(strm()) != cudaSuccess) return {model::Status::Error, "inkling2: the prompt failed"};
+        for (int i = 0; i < lanes(); ++i)   // the copy stream's last staging may still be in flight
+            if (lane_[i].copy && cudaStreamSynchronize(lane_[i].copy) != cudaSuccess)
+                return {model::Status::Error, "inkling2: the prompt's staging failed"};
         if (r.progress && reported > 0) r.progress(reported);
         return {};
     }
@@ -370,6 +416,10 @@ private:
             cudaSetDevice(lane().device);
             prompt_rows(b().pos, pos0, rows, b().dbounds, strm());
         }
+        // a long chunk copies every RAM expert of a spilled layer: the copies need no routing, so they run ahead on the copy
+        // stream, each layer's once the spilled visit before it has finished reading the shared staging
+        ahead_ = rows > kRoutedRows && first_spill_ >= 0 && lane_[0].copy != nullptr;
+        stage_ok_ = !ahead_ || stage_ahead(first_spill_);
         float* x0 = buf(Buf::X0);
         if (emb) {
             cudaMemcpyAsync(x0, emb, (size_t) rows * E * 4, cudaMemcpyHostToDevice, strm());
@@ -387,6 +437,7 @@ private:
                     if (cur_ == 0) cudaMemcpyAsync(ds_->tap(k), buf(s.hid), (size_t) rows * E * 4, cudaMemcpyDeviceToDevice, strm());
                     else tap_across(k, buf(s.hid), rows);
                 }
+                step_ = (int) si;
                 layer(s, rows, pos0);
             }
         }
@@ -573,7 +624,12 @@ private:
             // the pairs were just remapped, so `ids` holds slot indices. A long chunk (over 1,024 rows) reads most slots and
             // keeps the every-slot copy, as does the peer path, whose mask spans two cards' slots.
             bool staged = false;
-            if (!peer && rows <= 1024 && w.n_spill > 0) {
+            const bool ahead = ahead_ && stage_ok_ && !peer && w.n_spill > 0;
+            if (ahead) {   // the copy stream staged this layer's RAM experts under the visits before it
+                if (cudaStreamWaitEvent(strm(), lane().staged, 0) == cudaSuccess) staged = true;
+                else ahead_ = false;   // the wait could not be queued: stage inline, the safe way
+            }
+            if (!staged && !ahead && !peer && rows <= kRoutedRows && w.n_spill > 0) {
                 std::vector<int32_t> ids((size_t) pairs);
                 cudaStreamSynchronize(strm());
                 cudaMemcpy(ids.data(), b().ids, ids.size() * 4, cudaMemcpyDeviceToHost);
@@ -591,6 +647,8 @@ private:
                 uint8_t* base = w.experts + kept;
                 for (const StageOp& op : stage_plan(w.n_spill, card.data(), want.data(), kept_slots > 0)) {
                     uint8_t* dst = base + (uint64_t) op.slot * w.expert_stride;
+                    if (g_pdiag.on && op.kind == StageOp::Ram) ++g_pdiag.ram_ops, g_pdiag.h2d += (uint64_t) op.n * w.expert_stride;
+                    if (g_pdiag.on && op.kind == StageOp::Card) ++g_pdiag.card_ops, g_pdiag.d2d += w.expert_stride;
                     if (op.kind == StageOp::Card)
                         cudaMemcpyAsync(dst, copy[(size_t) op.slot], w.expert_stride, cudaMemcpyDeviceToDevice, strm());
                     else if (op.kind == StageOp::Ram)
@@ -601,13 +659,37 @@ private:
                 }
                 staged = true;
             }
-            if (!staged && !m_.stage_from_card(l, strm(), !peer))   // the elastic spill's card copies when the layer has them all
+            if (g_pdiag.on) ++g_pdiag.visits;
+            if (!staged && !ahead && !m_.stage_from_card(l, strm(), !peer)) {   // the elastic spill's card copies when the layer has them all
+                if (g_pdiag.on) ++g_pdiag.fulls, g_pdiag.full += (uint64_t) m_.ram_n(l) * w.expert_stride;
                 cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) m_.ram_n(l) * w.expert_stride, cudaMemcpyHostToDevice, strm());
-            cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
+            }
+            if (!ahead) cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
         }
         local_experts(w, g_.n_expert, rows);
+        if (w.slot_map && !staging_read()) ahead_ = false;   // the next staging could not be queued: the rest stages inline
         if (on_peer > 0) peer_join(on_peer);
     }
+
+    // Step si's RAM experts into the staging on the copy stream, after the products queued so far on the compute stream: the
+    // copy stream waits for them (`freed`), the copies and the guard after the layer's last slot run there, and `staged`
+    // follows them so the layer's own products can wait for it. False when any of it could not be queued.
+    bool stage_ahead(int si) {
+        if (si < 0) return true;
+        Lane& k = lane_[0];
+        const int l = g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer;
+        const LayerWeights& w = m_.layer(l);
+        if (!w.slot_map || w.n_spill <= 0) return true;
+        const int ne = g_.n_expert, kept = ne - w.n_spill;
+        return cudaEventRecord(k.freed, k.stream) == cudaSuccess && cudaStreamWaitEvent(k.copy, k.freed, 0) == cudaSuccess &&
+               (m_.ram_n(l) == 0 ||
+                cudaMemcpyAsync(w.experts + (uint64_t) kept * w.expert_stride, w.spill_host,
+                                (size_t) m_.ram_n(l) * w.expert_stride, cudaMemcpyHostToDevice, k.copy) == cudaSuccess) &&
+               cudaMemsetAsync(w.experts + (uint64_t) ne * w.expert_stride, 0, kSlotGuard, k.copy) == cudaSuccess &&
+               cudaEventRecord(k.staged, k.copy) == cudaSuccess;
+    }
+    // A spilled visit's products are queued over the staging: the chunk's next spilled visit's copies may start.
+    bool staging_read() { return !ahead_ || next_spill_[(size_t) step_] < 0 || stage_ahead(next_spill_[(size_t) step_]); }
 
     // The rows with a choice on the second card, their normed rows, choices and weights to it (the main card's kernel writes them
     // to page-locked memory), which runs its experts' pairs over the same kernels into its own partial sums (the choices it has
@@ -808,6 +890,11 @@ private:
     float* hand_ = nullptr;       // the layer split: page-locked slots of a chunk's rows crossing between the cards
     int tap_slot0_ = 0;           // the first drafter tap's slot
     cudaEvent_t done_[2] = {};
+    std::vector<int> next_spill_;   // [step] the next step whose layer has RAM experts (-1: none)
+    int first_spill_ = -1;          // the first such step
+    int step_ = 0;                  // the step being queued
+    bool ahead_ = false;            // this chunk stages on the copy stream (stage_ahead)
+    bool stage_ok_ = true;          // the copies ahead are queued; false falls back to staging inline
 };
 
 }  // namespace
