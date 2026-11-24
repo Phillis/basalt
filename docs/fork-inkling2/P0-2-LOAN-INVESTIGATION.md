@@ -64,3 +64,28 @@ The next step is therefore mechanical, not speculative:
 - The rebalance at two sessions was *not* proven unsafe (the bisect cleared it); it is simply not enabled, because
   the loan it depends on is not.
 - Everything else in this session's work is independent of the loan and is in the shipped build.
+
+## Update: five hypotheses tested, all negative
+
+After the bisect, three more candidate causes were implemented and each was judged by `tools/stress_two_slot.py`:
+
+| hypothesis | change | result |
+|---|---|---|
+| the loan's publication races a read | `publish_loan()` returns early while `prompt_busy_` | still alternates |
+| an upload queued by the other slot lands mid-read | `PromptGuard` drains `drain_loan_upload()` before the first byte | still alternates |
+| the batch graph key lacks the placement | `key.push_back(m_.placement_epoch())` in `batch_stage` (the spec's P0-1 item, and what the solo key needed after #650) | still alternates |
+| the prompt cache's pinned checkpoints interact with a loaned arena | `prompt-cache 0` | every prompt succeeds, every decode session fails, 23 crashes - different, not better |
+| the rebalance is the culprit | bisect: rebalance back to one session, loan on | crash unchanged - the rebalance is cleared |
+
+**Sharper characterization, and the most useful result here**: failures are not per round but per process. Round 1
+in a fresh engine always works; the *second* round in the same process dies. A crash restarts the engine, so the
+round after it works again - which is what made it look like an alternation. The state that breaks it is therefore
+created by a *completed* round, i.e. at a request's end, exactly as the spec suspected ("Suspect this first: the
+alternation began after a teardown"). With the loan on, the arena is the loan's home between prompts; a request's
+end is when `recall_loan(-1)` ("prompt loan recall at sleep") runs, and the next request's read is the first thing
+to touch the arena afterwards.
+
+That narrows the search to the sleep recall and the state it leaves (`lent_`, `loan_list_`, `copy_`, `loan_flag_`,
+each layer's `blob_table`), with another session's request able to start in between. Instrument exactly that
+transition - but from a build that can be symbolized (`RelWithDebInfo` + PDB first): five blind attempts have now
+been spent on hypotheses the log alone could not rank.
