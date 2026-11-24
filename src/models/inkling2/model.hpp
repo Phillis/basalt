@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -180,6 +181,27 @@ public:
     uint8_t* prompt_arena(uint64_t bytes, std::string& err);
     /// Serialises prompt reads: one arena and one shared staging means two reads must not race for them.
     std::mutex& prompt_lock() { return prompt_mu_; }
+    /// The staging is one allocation for the whole model: a prompt read takes it exclusively, a decode window shared.
+    std::shared_mutex& stage_lock() { return stage_mu_; }
+    /// True while a prompt read owns the arena: the loan neither uploads (`submit_loan`) nor publishes (`publish_loan`).
+    bool prompt_busy_now() const { return prompt_busy_; }
+    /// Held for a prompt read: the arena, the staging, and the loan's quiet period.
+    class PromptGuard {
+    public:
+        explicit PromptGuard(InklingModel& m)
+            : m_(m), stage_(m.stage_mu_), lock_(m.prompt_mu_), was_(m.prompt_busy_) {
+            m_.prompt_busy_ = true;
+            if (!m_.drain_loan_upload()) m_.wedge();   // an upload queued by the other slot may still be landing
+        }
+        ~PromptGuard() { m_.prompt_busy_ = was_; }
+        PromptGuard(const PromptGuard&) = delete;
+        PromptGuard& operator=(const PromptGuard&) = delete;
+    private:
+        InklingModel& m_;
+        std::unique_lock<std::shared_mutex> stage_;
+        std::unique_lock<std::mutex> lock_;
+        bool was_;
+    };
     /// After a decode window: starts the loan's uploads when one is due (`publish_at`: the position its copies become
     /// visible at) and queues their next bounded part. Never makes a copy visible.
     bool submit_loan(int64_t publish_at);
@@ -330,7 +352,9 @@ private:
     bool loan_stuck_ = false;             ///< an upload or a reader of the loan could not be confirmed finished: its memory is never released
     uint8_t* prompt_mem_ = nullptr;        ///< the one prompt arena (prompt_arena): every session carves its chunk buffers from it
     uint64_t prompt_mem_bytes_ = 0;        ///< the largest carve asked for
+    mutable std::shared_mutex stage_mu_;    ///< prompt reads exclusive, decode windows shared
     std::mutex prompt_mu_;                 ///< a prompt read owns the arena and the shared staging until it returns
+    bool prompt_busy_ = false;             ///< a prompt read holds the arena: the loan stays out of it
     uint8_t* loan_arena_ = nullptr;
     uint64_t loan_arena_bytes_ = 0;
     uint8_t* loan_stage_ = nullptr;   ///< the shared staging's second address range

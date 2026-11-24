@@ -370,8 +370,8 @@ private:
     // which reports a chunk once the card has run it.
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
                       std::vector<int32_t>& hist, int32_t pad, const Prepare& prepare) {
-        // one arena and one shared staging: a read owns them until it returns
-        std::unique_lock<std::mutex> arena_lock(m_.prompt_lock());
+        // one arena and one shared staging: a read owns them until it returns, and the loan stays out of them meanwhile
+        InklingModel::PromptGuard arena_lock(m_);
         const int chunks = (n + kChunk - 1) / kChunk;
         const int per = (n + chunks - 1) / chunks;
         std::string err;

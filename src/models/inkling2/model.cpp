@@ -1250,9 +1250,10 @@ bool InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
 // path's view of the staging) stay as they are.
 bool InklingModel::loan_ready() {
     if (loan_state_ != 0) return loan_state_ > 0;
-    // one session only: the loan's VA range is the arena, and with two sessions one session's decode keeps copies
-    // loaned in it while the other reads a prompt into it - that crashed (access violation in the prompt read).
-    if (!elastic_ || sessions() != 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
+    // More than one session is fine: a prompt read excludes the loan's uploads and its publication for its whole length
+    // (`prompt_busy_`), drains what was in flight, and every read recalls first. The batch graph key carries the
+    // placement epoch, so a window captured before a loan cannot replay over it.
+    if (!elastic_ || sessions() < 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
     loan_state_ = -1;
     if (cudaHostAlloc((void**) &loan_addr_, spill_order_.size() * sizeof(unsigned long long), cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();
@@ -1341,6 +1342,8 @@ bool InklingModel::submit_loan(int64_t publish_at) {
 
 bool InklingModel::publish_loan(void* stream, int64_t at) {
     if (wedged()) return false;
+    // the loaned copies live in the arena and the staging: a read owns both, so the plan waits for the next window
+    if (prompt_busy_) return true;
     if (!loan_pending()) return true;
     loan_publish_at_ = -1;
     if (!queue_loan(~0ull)) return false;
@@ -1371,6 +1374,13 @@ bool InklingModel::publish_loan(void* stream, int64_t at) {
         ++layer_copies_[l];
     }
     loan_plan_.clear();
+    // the table entries were queued on this session's stream: another session reads the table from its own stream, so
+    // the publication is ordered here rather than left to chance (a reader could otherwise see a half-written entry)
+    if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) {
+        wedge();
+        basalt::log::error("basalt inkling2", "a prompt loan publication could not be confirmed; restart the engine");
+        return false;
+    }
     if (before != card_copies()) ++epoch_;
     log_copy_change(("prompt loan at " + std::to_string(at)).c_str(), before);
     return true;

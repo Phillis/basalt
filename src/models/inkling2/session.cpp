@@ -411,6 +411,7 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "inkling2: an empty window"};
         if (m_.wedged()) return wedged();
         if (r.pos + r.n_tokens > m_.context()) return {model::Status::Refused, "inkling2: the window runs past the context"};
+        std::shared_lock<std::shared_mutex> stage_read(m_.stage_lock());   // a prompt read stages in the same allocation
         std::string err;
         const int64_t loaned_before = m_.loaned();
         if (heat_tally_) settle_window(r.pos);
@@ -503,6 +504,9 @@ protected:
         if (!drop_stale_read_ahead(err)) return false;
         key.push_back((uint64_t) stage(v.w.tokens.data(), nullptr, v.w.rows, 0, v.w.positions.data()));
         key.push_back(cpu_ = cpu_layers());
+        // [P0-2] the placement is part of the key exactly as in the solo path: a loan or a rebalance moves copies, and a
+        // window captured before it must not replay (the two-session loan crashed on precisely that)
+        key.push_back(m_.placement_epoch());
         if (cpu_) sh_->cpu->wake();
         if (!check(err)) return false;
         held.passed = true;
@@ -605,7 +609,8 @@ public:
         hist_.resize((size_t) pos);
         if (sh_->prompt && n_rows > 16) {
             PromptRunner::Prepare prepare;
-            if (heat_tally_) prepare = [&] { return recall_loan(pos); };
+            // unconditional: a prompt writes the arena and the staging the loan's copies live in
+            prepare = [&] { return recall_loan(pos); };
             const model::Result res = sh_->prompt->read_rows(rows, n_rows, pos, g_.image_token, hist_, vc_, dspark_, stream_, prepare);
             if (!res.ok()) hist_.resize((size_t) pos);
             return res;
@@ -942,7 +947,13 @@ public:
                 return false;
             }
             loan_hits_.resize(t.size());
-            for (size_t pair : m_.loaned_pairs()) loan_hits_[pair] += t[pair] - loan_start_[pair];
+            // The baseline is per session and only the session that published has one; with two sessions the other one
+            // recalls (a prompt's prepare, or the sleep). Reading an empty baseline indexed any pair was a null + 4*pair
+            // read - the two-session crash at 0x16E0/0x1708 (pairs 1464/1474, a looped core layer's hottest RAM
+            // experts, first in the rank-ordered loan list). A session with no baseline simply skips its accounting;
+            // the publisher sets a fresh one at its next publish.
+            if (loan_start_.size() == t.size())
+                for (size_t pair : m_.loaned_pairs()) loan_hits_[pair] += t[pair] - loan_start_[pair];
             loan_start_.clear();
         }
         return m_.recall_loan(stream_, at < 0 ? std::string("prompt loan recall at sleep") : "prompt loan recall at " + std::to_string(at));
