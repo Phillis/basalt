@@ -36,7 +36,11 @@ Flow Request::read_prompt() {
     if (runtime_.o.prompt_cache > 0 && runtime_.o.turn_token >= 0)
         for (int64_t i = n - 1; i > resume; --i)
             if (ids[(size_t) i] == runtime_.o.turn_token) { turn_at = i; break; }
-    if (runtime_.o.prompt_cache > 0 && turn_checkpoint_at_last_token() && n - 1 > resume) turn_at = n - 1;
+    // A model whose template puts its generation header after the conversation boundary keeps the boundary as the
+    // turn's checkpoint (the prefix the NEXT request renders) and takes n - 1 in addition (see part_checkpoint), which
+    // is what pass 1 of the same turn resumes from. Overwriting the boundary with n - 1 made the only checkpoint sit
+    // after the header, which no later turn's history contains - every agent turn re-read its whole context.
+    if (runtime_.o.prompt_cache > 0 && turn_at < 0 && turn_checkpoint_at_last_token() && n - 1 > resume) turn_at = n - 1;
     // (opt-in) a short turn of --tail-role-token's role right before the new assistant turn (the server's
     // trailing reasoning-effort turn) stays out of the checkpoint, so the next request - another effort, or the
     // next turn of the chat - finds the conversation without it

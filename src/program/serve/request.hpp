@@ -111,7 +111,10 @@ protected:
     int64_t root_at{};
     int64_t media_at{};
     /// Whether the read stops at `to` with a conversation checkpoint: the root, the end of the last picture, the turn.
-    bool part_checkpoint(int64_t to) const { return to == turn_at || to == root_at || to == media_at; }
+    bool part_checkpoint(int64_t to) const {
+        return to == turn_at || to == root_at || to == media_at ||
+               (to == n - 1 && turn_checkpoint_at_last_token());   // the generation header boundary, for pass 1
+    }
     int64_t at{};
     int64_t fold_p0{};
     double prompt_ms{};
