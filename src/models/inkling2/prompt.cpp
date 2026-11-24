@@ -36,7 +36,7 @@ namespace fp4 = basalt::prefill::fp4;
 namespace mxfp8 = basalt::prefill::mxfp8;
 namespace q8 = basalt::prefill::q8;
 
-constexpr int kChunk = kPromptChunk;
+const int& kChunk = kPromptChunk;   // [prefill] from --prompt-chunk, read at every use
 constexpr int kRoutedRows = 1024;   // a chunk this short stages only the slots its rows route to ([609])
 
 // [diag] BASALT_DIAG_PROMPT=1: the bytes the prompt path stages and how many visits it takes, so the split

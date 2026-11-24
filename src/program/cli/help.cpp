@@ -111,6 +111,8 @@ void usage() {
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
+    "  --prompt-chunk N     [inkling2] rows of one prompt chunk (default 6144): more rows amortise the spill\n"
+    "                       staging over more of them, and take card room that decode's expert copies use\n"
     "  --prefill-waves N    [inkling2] split a spilled layer's prompt staging into N waves so one wave's copy\n"
     "                       overlaps the next one's product (0/1 = serial; default 3, at most 4)\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"

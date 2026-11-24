@@ -6,6 +6,7 @@
 // The forward follows vLLM's Inkling 2 DSpark draft (vllm/models/inkling2/nvidia/dspark.py, Apache-2.0, Copyright
 // contributors to the vLLM project).
 #include "models/inkling2/dspark.hpp"
+#include "models/inkling2/prompt.hpp"
 
 #include <cstdio>
 
@@ -893,6 +894,11 @@ bool dspark_parse_flag(const std::string& a, model::FlagArgs& args, program::Com
     if (a == "--spec") {
         o.spec = std::atoi(args.next("--spec"));
         o.spec_given = true;
+    } else if (a == "--prompt-chunk") {
+        // [prefill] Rows of one prompt chunk (prompt.hpp): more rows amortise a spilled layer's staging over more
+        // of them, fewer leave the card more room for the expert copies decode reads. 1,024 is the routed cutoff.
+        const int n = std::atoi(args.next("--prompt-chunk"));
+        if (n >= 1024) kPromptChunk = std::min(16384, n);
     } else if (a == "--prefill-waves") {
         // [W1] The prompt staging's wave pipeline: N waves per spilled layer's visit (0 or 1 = the serial staging).
         g_prefill_waves = std::max(0, std::atoi(args.next("--prefill-waves")));

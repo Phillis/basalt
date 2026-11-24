@@ -17,7 +17,11 @@ namespace basalt::models::inkling2 {
 class DsparkHook;
 
 /// The most rows one prompt chunk runs (the drafter's tap holds as many).
-constexpr int kPromptChunk = 8192;
+/// [prefill] Rows of one prompt chunk, set by --prompt-chunk (default 6,144). Bigger amortises a spilled
+/// layer's staging over more rows - the staging is one pass per chunk - but the chunk's buffers come out of
+/// the card's room, so the expert copies decode keeps are fewer: 4,096 rows costs no room and decodes best,
+/// 8,192 roughly doubles prefill and costs ~18% decode. Not a constexpr: the flag is parsed before the plan.
+inline int kPromptChunk = 6144;
 
 class PromptRunner {
 public:
