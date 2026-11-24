@@ -1218,6 +1218,18 @@ int InklingModel::rebalance(int max_swaps) {
     return done;
 }
 
+uint8_t* InklingModel::prompt_arena(uint64_t bytes, std::string& err) {
+    if (prompt_mem_) return bytes <= prompt_mem_bytes_ ? prompt_mem_ : nullptr;
+    if (cudaMalloc((void**) &prompt_mem_, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        prompt_mem_ = nullptr;
+        err = "out of device memory for the prompt path (" + std::to_string(bytes >> 20) + " MiB)";
+        return nullptr;
+    }
+    prompt_mem_bytes_ = bytes;
+    return prompt_mem_;
+}
+
 bool InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
     if (!base) {
         // freed only once no upload writes it and no reader of a loaned copy can still run
@@ -1238,7 +1250,7 @@ bool InklingModel::set_prompt_arena(uint8_t* base, uint64_t bytes) {
 // path's view of the staging) stay as they are.
 bool InklingModel::loan_ready() {
     if (loan_state_ != 0) return loan_state_ > 0;
-    if (!elastic_ || sessions() != 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
+    if (!elastic_ || sessions() < 1 || cards() != 1 || !loan_arena_ || spill_order_.empty() || !core::vmm::supported()) return false;
     loan_state_ = -1;
     if (cudaHostAlloc((void**) &loan_addr_, spill_order_.size() * sizeof(unsigned long long), cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();

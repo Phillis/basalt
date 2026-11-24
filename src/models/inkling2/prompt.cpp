@@ -169,8 +169,7 @@ class Prompt final : public PromptRunner {
 public:
     Prompt(InklingModel& m, cudaStream_t s) : m_(m), g_(m.geo()) { lane_[0].stream = s; }
     ~Prompt() override {   // every read synced its streams before it returned
-        // the copies decode keeps in the arena go back to RAM; an upload into it that may still run keeps the arena
-        if (m_.has_spill() && m_.cards() == 1 && !m_.set_prompt_arena(nullptr, 0)) return;
+        // the arena belongs to the model now: it goes with it, not with this session
         for (cudaEvent_t& e : done_)
             if (e) cudaEventDestroy(e);
         for (int i = lanes() - 1; i >= 0; --i) {
@@ -182,7 +181,7 @@ public:
             if (k.staged) cudaEventDestroy(k.staged);
             if (k.copy) cudaStreamDestroy(k.copy);
             if (i > 0 && k.stream) cudaStreamDestroy(k.stream);
-            if (k.mem) cudaFree(k.mem);
+            // k.mem is the model's arena (prompt_arena): never freed here
         }
         if (hand_) cudaFreeHost(hand_);
         for (void* q : {(void*) px_nrm_, (void*) px_ids_, (void*) px_rw_, (void*) px_out_, (void*) px_cnt_})
@@ -264,11 +263,7 @@ public:
     bool init_lane(std::string& err) {
         Carve c;
         carve(c, b(), g_);
-        if (cudaMalloc(&lane().mem, c.at) != cudaSuccess) {
-            cudaGetLastError();
-            err = "out of device memory for the prompt path (" + std::to_string(c.at >> 20) + " MiB)";
-            return false;
-        }
+        if (!(lane().mem = m_.prompt_arena(c.at, err))) return false;   // one arena per model, not per session
         c = Carve{};
         c.base = static_cast<uint8_t*>(lane().mem);
         carve(c, b(), g_);
@@ -375,6 +370,8 @@ private:
     // which reports a chunk once the card has run it.
     model::Result run(const int32_t* tokens, const float* emb, int n, int64_t pos, const model::PrefillRequest& r,
                       std::vector<int32_t>& hist, int32_t pad, const Prepare& prepare) {
+        // one arena and one shared staging: a read owns them until it returns
+        std::unique_lock<std::mutex> arena_lock(m_.prompt_lock());
         const int chunks = (n + kChunk - 1) / kChunk;
         const int per = (n + chunks - 1) / chunks;
         std::string err;

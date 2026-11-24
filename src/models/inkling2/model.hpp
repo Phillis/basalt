@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -173,6 +174,12 @@ public:
     /// Null `base`: the arena goes; false when a loan upload into it could not be confirmed finished (its memory must not be
     /// freed then).
     bool set_prompt_arena(uint8_t* base, uint64_t bytes);
+    /// The prompt path's arena, ONE per model: every session's chunk buffers are carved from it and a read holds it for
+    /// its length (see prompt_lock). Two arenas of 8,192 rows do not fit beside two 128k caches; one does, and the engine
+    /// runs one prompt at a time anyway. `bytes` the largest carve asked for; false when the card cannot take it.
+    uint8_t* prompt_arena(uint64_t bytes, std::string& err);
+    /// Serialises prompt reads: one arena and one shared staging means two reads must not race for them.
+    std::mutex& prompt_lock() { return prompt_mu_; }
     /// After a decode window: starts the loan's uploads when one is due (`publish_at`: the position its copies become
     /// visible at) and queues their next bounded part. Never makes a copy visible.
     bool submit_loan(int64_t publish_at);
@@ -321,6 +328,9 @@ private:
     size_t loan_next_ = 0;                ///< the plan's uploads queued so far
     bool loan_inflight_ = false;          ///< uploads queued since the copy stream was last confirmed idle
     bool loan_stuck_ = false;             ///< an upload or a reader of the loan could not be confirmed finished: its memory is never released
+    uint8_t* prompt_mem_ = nullptr;        ///< the one prompt arena (prompt_arena): every session carves its chunk buffers from it
+    uint64_t prompt_mem_bytes_ = 0;        ///< the largest carve asked for
+    std::mutex prompt_mu_;                 ///< a prompt read owns the arena and the shared staging until it returns
     uint8_t* loan_arena_ = nullptr;
     uint64_t loan_arena_bytes_ = 0;
     uint8_t* loan_stage_ = nullptr;   ///< the shared staging's second address range
