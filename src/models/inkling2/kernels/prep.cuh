@@ -174,6 +174,55 @@ __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t 
     }
 }
 
+// [V4] One scale per KkV4Group values: `scale[g]` for a four-bit code whose magnitude is at most 7, so the group's
+// largest magnitude maps to -8 or 7.  A warp holds one 128-value row (four values a lane), so a group is kKvV4Group/4
+// lanes wide and the max reduces inside those lanes only.
+__device__ __forceinline__ void v4_scales(const float (&v)[4], float f, int lane, float (&scale)[kKvV4Groups]) {
+    constexpr int kLanesPerGroup = kKvV4Group / 4;
+    float a = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
+#pragma unroll
+    for (int m = 1; m < kLanesPerGroup; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    scale[lane / kLanesPerGroup] = a / (float) kKvV4CodeMax;
+}
+
+// [V4] A lane's four consecutive values as two code bytes plus the group's scale; the lane holding a group's first
+// value writes its fp16 scale after the codes.  Each byte belongs to one lane, so no two lanes write the same byte.
+__device__ __forceinline__ void store_v4(void* row, int lane, const float (&v)[4], const float (&scale)[kKvV4Groups]) {
+    const int idx0 = lane * 4;
+    const int group = idx0 / kKvV4Group;
+    const float s = scale[group];
+    uint8_t* codes = static_cast<uint8_t*>(row);
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        int lo = s > 0.f ? max(kKvV4CodeMin, min(kKvV4CodeMax, __float2int_rn(v[2 * b] / s))) : 0;
+        int hi = s > 0.f ? max(kKvV4CodeMin, min(kKvV4CodeMax, __float2int_rn(v[2 * b + 1] / s))) : 0;
+        codes[(size_t) (idx0 / 2 + b)] = (uint8_t) ((lo & 0xF) | ((hi & 0xF) << 4));
+    }
+    if (idx0 % kKvV4Group == 0)
+        reinterpret_cast<__half*>(codes + kKvV4CodeBytes)[group] = __float2half_rn(s);
+}
+
+// [V4] 16 values of a row from its eight code bytes and their scale, as fp32.
+__device__ __forceinline__ void unpack16_v4(const uint2 u, float scale, float (&f)[16]) {
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {   // four bytes a word, a byte a pair of values
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            f[8 * i + 2 * j] = (float) (lo >= 8 ? lo - 16 : lo) * scale;
+            f[8 * i + 2 * j + 1] = (float) (hi >= 8 ? hi - 16 : hi) * scale;
+        }
+}
+
+// [V4] A row's fp16 scales (after its codes) as fp32.
+__device__ __forceinline__ void v4_row_scales(const uint8_t* row, float (&s)[kKvV4Groups]) {
+#pragma unroll
+    for (int g = 0; g < kKvV4Groups; ++g) s[g] = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[g]);
+}
+
 // Warps 2 and 3 of head g for row r at position p: the clipped (and scaled) queries of heads 3g..3g+2 into q3
 // [3][kHeadDim], warp 3 also their relative states into r3 [3][kRel] and their sinks into s3 [3]. Every projection value a
 // warp takes is loaded before its first sum, so the warp waits for one memory trip, not one a head.
