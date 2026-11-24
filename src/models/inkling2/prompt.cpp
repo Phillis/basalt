@@ -45,6 +45,8 @@ namespace {
 struct PromptDiag {
     uint64_t h2d = 0, d2d = 0, full = 0;
     int visits = 0, ram_ops = 0, card_ops = 0, fulls = 0;
+    uint64_t slot_h2d = 0, slot_d2d = 0;   // [per-slot staging] bytes from RAM and from a card copy
+    int slot_copies = 0, slot_runs = 0;
     bool on = std::getenv("BASALT_DIAG_PROMPT") != nullptr;
 } g_pdiag;
 }       // rows of one chunk forward
@@ -62,6 +64,8 @@ struct Carve {
         at = (at + 255) & ~(size_t) 255;
         T* p = base ? reinterpret_cast<T*>(base + at) : nullptr;
         at += n * sizeof(T);
+        // [diag] what each buffer of a chunk costs the card (the sizing pass only)
+        if (g_pdiag.on && !base) log::info("basalt inkling2", "carve: %7.2f MiB  -> %7.1f MiB total", (double) (n * sizeof(T)) / 1048576.0, (double) at / 1048576.0);
         return p;
     }
 };
@@ -389,6 +393,9 @@ private:
                           " (h2d %.1f ms at 15.75 GB/s), %d ram ops, %d card ops, %d full copies",
                           rows, g_pdiag.visits, h2d / 1073741824.0, full / 1073741824.0, d2d / 1073741824.0,
                           (h2d + full) / 15.75e6, g_pdiag.ram_ops, g_pdiag.card_ops, g_pdiag.fulls);
+                log::info("basalt inkling2", "prompt diag: per-slot staging %d copies D2D %.2f GiB, %d runs H2D %.2f GiB",
+                          g_pdiag.slot_copies, (double) g_pdiag.slot_d2d / 1073741824.0, g_pdiag.slot_runs,
+                          (double) g_pdiag.slot_h2d / 1073741824.0);
                 g_pdiag = PromptDiag{};
             }
             if (tokens) hist.insert(hist.end(), tokens + t0, tokens + t0 + rows);
@@ -660,9 +667,9 @@ private:
                 staged = true;
             }
             if (g_pdiag.on) ++g_pdiag.visits;
-            if (!staged && !ahead && !m_.stage_from_card(l, strm(), !peer)) {   // the elastic spill's card copies when the layer has them all
+            if (!staged && !ahead && w.n_spill > 0) {   // inline: the same per-slot staging, on the compute stream
                 if (g_pdiag.on) ++g_pdiag.fulls, g_pdiag.full += (uint64_t) m_.ram_n(l) * w.expert_stride;
-                cudaMemcpyAsync(w.experts + kept, w.spill_host, (size_t) m_.ram_n(l) * w.expert_stride, cudaMemcpyHostToDevice, strm());
+                stage_layer(l, strm());
             }
             if (!ahead) cudaMemsetAsync(w.experts + (uint64_t) g_.n_expert * w.expert_stride, 0, kSlotGuard, strm());   // spill.hpp
         }
@@ -680,13 +687,49 @@ private:
         const int l = g_.visits[(size_t) walk_.steps[(size_t) si].visit].layer;
         const LayerWeights& w = m_.layer(l);
         if (!w.slot_map || w.n_spill <= 0) return true;
-        const int ne = g_.n_expert, kept = ne - w.n_spill;
-        return cudaEventRecord(k.freed, k.stream) == cudaSuccess && cudaStreamWaitEvent(k.copy, k.freed, 0) == cudaSuccess &&
-               (m_.ram_n(l) == 0 ||
-                cudaMemcpyAsync(w.experts + (uint64_t) kept * w.expert_stride, w.spill_host,
-                                (size_t) m_.ram_n(l) * w.expert_stride, cudaMemcpyHostToDevice, k.copy) == cudaSuccess) &&
-               cudaMemsetAsync(w.experts + (uint64_t) ne * w.expert_stride, 0, kSlotGuard, k.copy) == cudaSuccess &&
+        const int ne = g_.n_expert;
+        if (cudaEventRecord(k.freed, k.stream) != cudaSuccess || cudaStreamWaitEvent(k.copy, k.freed, 0) != cudaSuccess)
+            return false;
+        if (!stage_layer(l, k.copy)) return false;
+        return cudaMemsetAsync(w.experts + (uint64_t) ne * w.expert_stride, 0, kSlotGuard, k.copy) == cudaSuccess &&
                cudaEventRecord(k.staged, k.copy) == cudaSuccess;
+    }
+
+    // A layer's RAM experts into its own staging on `st`: every slot that has a card copy is a device-to-device copy from
+    // it (the elastic spill's, a loan's too - they are the same bytes), and the rest come from RAM in one run per stretch
+    // of consecutive slots, since host and staging are both laid out in slot order.
+    bool stage_layer(int l, cudaStream_t st) {
+        const LayerWeights& w = m_.layer(l);
+        const int ne = g_.n_expert, kept_slots = ne - w.n_spill;
+        const int32_t* slot = m_.slots_of(l);
+        int run_at = -1, run = 0;
+        const auto flush = [&]() {
+            if (run <= 0) return true;
+            if (g_pdiag.on) g_pdiag.slot_h2d += (uint64_t) run * w.expert_stride, ++g_pdiag.slot_runs;
+            const bool ok = cudaMemcpyAsync(w.experts + (uint64_t) (kept_slots + run_at) * w.expert_stride,
+                                            w.spill_host + (uint64_t) run_at * w.expert_stride,
+                                            (size_t) run * w.expert_stride, cudaMemcpyHostToDevice, st) == cudaSuccess;
+            run = 0;
+            return ok;
+        };
+        for (int e = 0; e < ne; ++e) {
+            const int s = slot[e];
+            if (s < kept_slots) continue;   // a kept expert: its own memory, already in place
+            const int at = s - kept_slots;
+            const void* c = m_.copy_of(l, e);
+            if (!c) {                       // no copy: from RAM, extending the run when the slots are consecutive
+                if (run > 0 && at != run_at + run && !flush()) return false;
+                if (run == 0) run_at = at;
+                ++run;
+                continue;
+            }
+            if (!flush()) return false;
+            if (g_pdiag.on) g_pdiag.slot_d2d += w.expert_stride, ++g_pdiag.slot_copies;
+            if (cudaMemcpyAsync(w.experts + (uint64_t) s * w.expert_stride, c, w.expert_stride, cudaMemcpyDeviceToDevice, st) !=
+                cudaSuccess)
+                return false;
+        }
+        return flush();
     }
     // A spilled visit's products are queued over the staging: the chunk's next spilled visit's copies may start.
     bool staging_read() { return !ahead_ || next_spill_[(size_t) step_] < 0 || stage_ahead(next_spill_[(size_t) step_]); }
