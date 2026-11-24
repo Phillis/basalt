@@ -102,3 +102,41 @@ request measures 67.0 tok/s against the second's 67.7.
   raised; the config is sized around it, not against it.
 - Measured with `tools/bench.ps1` (unique random words every run, warm-up discarded, prompts with cached
   content rejected, engine `pp=`/`tg=` as the truth, median/min/max/n, >=2 processes per arm).
+## 6. Two concurrent sessions (the tuned case)
+
+For two 128k conversations at once - the case that matters most here - the profile is
+**`basalt_config-2x128k-fast.json`** launched with **`--prompt-chunk 3072`**:
+
+```json
+{ "max-context": 262144, "parallel": 2, "kv": "fp8v4", "vram-reserve-mib": 512,
+  "ram-reserve-mib": 512, "expert-cache": "auto", "spec": 8, "prompt-cache": 6 }
+```
+
+Measured (two concurrent 30k-token prompts, then 300-token generations in both slots):
+
+| profile | chunk | decode aggregate | prefill aggregate | per-stream prefill | plan |
+|---|---|---|---|---|---|
+| **2 x 128k (shipped)** | **3,072** | **73.0 tok/s** (36.5 each) | **1,927 tok/s** | 964 tok/s | cuda0 2.8 / ram 12.4 |
+| 2 x 128k | 2,048 | 72.7 tok/s | 1,496 tok/s | 748 | cuda0 3.0 / ram 12.2 |
+| 2 x 128k | 4,096 | 66.7 tok/s | 2,102 tok/s | 1,051 | cuda0 2.5 / ram 12.7 |
+| **2 x 160k** (`basalt_config-2x160k.json`) | 3,072 | 70.2 tok/s | 1,881 tok/s | 940 | cuda0 1.7 / ram 13.5 |
+| 2 x 192k | 2,048 | - | - | - | does not fit: 532 MiB short |
+
+So **2 x 160k costs almost nothing** (70.2 vs 73.0 decode) - that is the useful surprise: 320k of total
+context fits on the 12 GB card. 2 x 192k does not. `vram-reserve-mib 512` measured no worse than 768 at two
+slots and leaves the copies more room.
+
+The chunk choice at two slots is the same trade as at one, shifted: 2,048 decodes best by 0.3 tok/s and
+prefills 22% worse, 4,096 prefills best by 9% and decodes 9% worse. 3,072 is the balance.
+
+### Where two slots lose, measured
+
+- **Copy residency**: hit rate 63-82% at two slots against 93% at one, because two KV caches (1.7 GiB each at
+  128k) and two prompt arenas come out of the same 12 GB.
+- **The prompt loan is off**: `loan_ready()` requires `sessions() == 1`, so the machinery that pushes residency
+  from 1,034 to 1,593 copies during a single session does not run with two. Making the loan per session is the
+  next real win here - it is a VRAM-residency fix, not a quality change.
+- **Acceptance is content-bound, not batching-bound**: on a predictable prompt two slots measured
+  **100% and 99% acceptance, dl 2.5-2.8, ~110 tok/s aggregate** against 80 solo; on free prose the same
+  configuration measured 34-56%. The verifier does not degrade when the drafts are good, so the earlier
+  "batching loses" reading was the content, not the batch.
