@@ -126,3 +126,39 @@ wait on).
 
 **P0-2 is parked with the loan single-session**, per the review session's rule: the trace did not name the fault
 inside the time box.
+## RESOLVED (81e26996): the crash was a per-session tally baseline read with NULL data()
+
+`Session::recall_loan()` settles the loaned copies' heat from a **per-session** `loan_start_`, but the loan is
+model-level and only the session that ran `publish_loan()` has a baseline. With two sessions the *other* one recalls
+(a prompt's `prepare`, or the sleep recall), its `loan_start_` is empty (`data() == nullptr`), and the loop read
+`NULL + 4*pair` - pairs 1464/1474 (0x16E0/0x1708 as reported), layer 11's hottest RAM experts, first in the
+rank-ordered loan list. It was found by reading the code, not by the trace.
+
+Two fixes shipped together:
+
+1. the accounting runs only when `loan_start_.size() == t.size()` (a session without a baseline skips it; the
+   publisher refreshes its own at the next publish);
+2. `publish_loan()` now synchronises after writing the blob-table entries, because the entries are queued on the
+   publishing session's stream and another session reads the table from its own - nothing ordered a reader after a
+   publish before.
+
+The proper version of (1) is a later commit: at publication, read *every* session's tally as the baseline and let each
+session settle its own hits, so loaned copies earn heat from both conversations.
+
+### Measured after the fix (2 x 128k, chunk 5,120, reserve 256)
+
+| | before (loan single-session) | now |
+|---|---|---|
+| stress rounds, one process | crashed on the 2nd round | **20/20, 0 crashes, 0 restarts** |
+| decode during the other slot's ~20k read | 22.8-23.7 tok/s per stream | **23.3-25.6** |
+| prefill during the other slot's decode | 1,032-1,050 t/s | 953-1,048 |
+| decode hit rate at two sessions | 60-70% | **93.0%** |
+| scenario A (both decoding, no prompt) | 36.5 per stream | 35.5 per stream, hit 71% (no prompt, so no loan) |
+| parity suites | - | prompt, kernels, gqa_window all clean |
+| 17,348-token needle while the other slot decoded | - | **EXACT** |
+
+### Found while gating, not fixed (for P0-4)
+
+A single **86,525-token** prompt at the 2 x 128k profile fails: `inkling2: the caches cannot grow to 90112 positions:
+the array is full`. That is an elastic-KV cap per session, unrelated to the loan, and it bounds the "how much context
+does one slot actually get" question P0-4 is meant to answer with a curve.

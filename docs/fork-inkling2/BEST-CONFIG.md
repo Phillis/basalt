@@ -140,3 +140,16 @@ prefills 22% worse, 4,096 prefills best by 9% and decodes 9% worse. 3,072 is the
   **100% and 99% acceptance, dl 2.5-2.8, ~110 tok/s aggregate** against 80 solo; on free prose the same
   configuration measured 34-56%. The verifier does not degrade when the drafts are good, so the earlier
   "batching loses" reading was the content, not the batch.
+
+### Two-slot update (P0-2 fixed, 81e26996)
+
+The prompt loan and the copy rebalance now run with two sessions (the crash that blocked them was a per-session tally
+baseline read from NULL; see `P0-2-LOAN-INVESTIGATION.md`). Effect at 2 x 128k, chunk 5,120, reserve 256 MiB:
+
+| | value |
+|---|---|
+| decode hit rate, two sessions | **93%** (was 60-70%) |
+| decode during the other slot's ~20k read | 23.3-25.6 tok/s per stream |
+| prefill during the other slot's decode | 953-1,048 t/s per stream |
+| stress gate | 20/20 rounds, one process, no crashes |
+| single 86k prompt | fails: "the caches cannot grow to 90112 positions: the array is full" (P0-4) |
