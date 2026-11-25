@@ -4216,3 +4216,30 @@ loader and dispatch), and both dispatches (`attn_split_kernel<false,false,false,
 `attn_fused_kernel<false,false,N,true>`, plus `use_mma = !a.int8 && !a.f4`). **`nvfp4` is therefore still refused by the
 adapter** - a format the dispatch would send to the fp16 kernels reads four-bit rows at twice their size, which is the
 silent-corruption class this spec exists to avoid.
+
+## Session 67 - NVFP4 K/V, Item 3 complete: every reader and writer speaks it, and a first crash to explain
+
+- `attn.cu`: the fused kernel's value arm expands four-bit rows into the same fp16 pairs; its inline store writes both
+  planes with `k4_store_codes` (the key turned once, then stored to the staging row and the cache row); `use_mma` is
+  `!a.int8 && !a.f4`; `attn_split_kernel<false,false,false,true>` and `attn_fused_kernel<false,false,2|3,true>` are
+  instantiated, sized and launched.
+- `attn_prompt.cu`: `RawKvTile<FP8, F4>` with one 80-byte row size (the two planes are equal, so there is no per-plane
+  piece count to keep in step), `load_raw_tile`/`unpack_raw_tile` take F4, the decode reads eight code bytes and a
+  scale byte for 16 values (`k4_unpack16`) instead of the fp8/int8 16-byte piece, the eight fp16-only branches now
+  exclude F4, the kernel takes F4, and `attention_prompt` dispatches it.
+- `adapter.cpp`: `nvfp4` is accepted again (Item 3 is complete).
+- The inventory grep (spec 4.4) over the model's sources: 182 hits, saved to `C:\LLM\Basalt\F4-INVENTORY.txt`.
+
+**First run, `kv nvfp4`, 2 x 128k, reserve 256** (plan `cuda0=3.6GiB ram=11.6GiB` - note the smaller KV moves 1.5 GiB of
+experts onto the card against fp8's `cuda0=2.1`): Gate 0 correct on all three questions (391, Tokyo, planets). The 64k
+needle crashed the engine: it ended with no exit status right after
+`elastic spill: cache grow to 65536 positions at 36856; expert copies 762 -> 732`. No CUDA teardown line, no sticky
+error - an abrupt end.
+
+This is **not** the fp8v4 class: the cells are equal on this branch (`cell_bytes_at` is one number), so a reader mixing
+up the planes cannot overrun. It is more likely placement: nvfp4's 1.5 GiB of extra card room puts ~350 more expert
+copies on the card, and the crash lands in the grow where copies are demoted. The next experiment is therefore a
+reserve sweep (`vram-reserve-mib` 256 -> 512 -> 768, which pulls experts back off the card) before touching the codec:
+if the crash follows the card occupancy rather than the format, the codec is innocent.
+
+Still owed: parity (spec 5, including `kv_f4_parity`), the `BASALT_DIAG_KV` bounds assertion, and gates 1-5.

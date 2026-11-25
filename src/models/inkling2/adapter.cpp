@@ -60,11 +60,10 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        // [F4] nvfp4 is refused until its kernels are wired (Item 3 of SPEC-NVFP4-KV-MERGED-BASE): the writers and the
-        // split kernel speak it, the fused kernel's value arm and its store, the prompt loader and both dispatches do
-        // not yet - and a format the dispatch sends to the fp16 kernels reads four-bit rows at twice their size.
-        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8") {
-            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8 or int8", o.kv.c_str());
+        // [F4] nvfp4: E2M1 keys and values with an E4M3 scale per 16 values, 80 bytes a row for both planes, the keys
+        // (and every query read against them) turned by the normalized 128-point Hadamard transform.
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8" && o.kv != "nvfp4") {
+            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8, int8 or nvfp4", o.kv.c_str());
             return 2;
         }
         dspark_finish_flags(o);   // DSPARK HOOK

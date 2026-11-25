@@ -1,0 +1,182 @@
+﻿C:\LLM\rebase\b\include\basalt\models\inkling2\prompt_kernels.hpp:23:    const void* k_cache = nullptr;     ///< keys before pos0: [cap][kKvHeads][kHeadDim], position p in cell p % cap
+C:\LLM\rebase\b\include\basalt\models\inkling2\prompt_kernels.hpp:24:    const void* v_cache = nullptr;
+C:\LLM\rebase\b\include\basalt\models\inkling2\prompt_kernels.hpp:26:    const void* k_chunk = nullptr;     ///< keys from pos0 on: [chunk_cap][kKvHeads][kHeadDim], position p in cell p % chunk_cap
+C:\LLM\rebase\b\include\basalt\models\inkling2\prompt_kernels.hpp:27:    const void* v_chunk = nullptr;     ///< (a full layer passes its cache again; a sliding-window layer the chunk's stage)
+C:\LLM\rebase\b\include\basalt\models\inkling2\prompt_kernels.hpp:59:void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:21:constexpr int kKvInt8RowBytes = (kHeadDim + 4 + 15) & ~15;   ///< INT8 values and two fp16 scales, zero-padded to 16 bytes
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:33:BASALT_HD_ constexpr int kv_cache_row_bytes(bool fp8, bool int8, bool f4) {
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:34:    return f4 ? kKvF4RowBytes : fp8 ? kHeadDim : int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:37:BASALT_HD_ constexpr int kv_pair_bytes(bool fp8, bool int8, bool f4) { return 2 * kv_cache_row_bytes(fp8, int8, f4); }
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:53:constexpr int kRowK = kProjQ, kRowV = kProjQ + kProjKV, kProj = kProjQ + 2 * kProjKV;   ///< first rows of the ranges
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:120:    void* k_cache = nullptr;           ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or E4M3 (fp8 set)
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:121:    void* v_cache = nullptr;
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:143:    const void* k_cache = nullptr;
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:144:    const void* v_cache = nullptr;
+C:\LLM\rebase\b\include\basalt\models\inkling2\kernels.hpp:285:    int kv_cell = 0;                   ///< bytes of a cell (every key/value head)
+C:\LLM\rebase\b\src\models\inkling2\model.cpp:66:    {"attn_v.weight", kRowV, 1024, false},       {"attn_v_conv_proj.weight", kRowV + kOffTaps, 32, true},
+C:\LLM\rebase\b\src\models\inkling2\model.cpp:86:    const uint64_t per_pos = (uint64_t) kKvHeads * kv_pair_bytes(fp8, int8, f4);   // [F4] equal cells: 160 bytes a position
+C:\LLM\rebase\b\src\models\inkling2\model.cpp:865:                prefill::q8::transpose_scales(proj_sc + (size_t) kRowV * nb_e, kProjKV, E, w.proj_v_sc_t, nullptr);
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:77:    void *k_stage = nullptr, *v_stage = nullptr;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:125:    const size_t row_bytes = (size_t) std::max(std::max(kv_cache_row_bytes(false, false, false), kv_cache_row_bytes(true, false, false)),
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:126:                                               std::max(kv_cache_row_bytes(false, true, false), kv_cache_row_bytes(false, false, true)));
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:128:    b.k_stage = c.take<uint8_t>(stage);
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:129:    b.v_stage = c.take<uint8_t>(stage);
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:558:                {proj_c + (size_t) kRowV * (size_t) E, kProjKV, w.proj_v_sc_t, b().yq + kProjQ + kProjKV, kProj},
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:569:            q8::gemm(proj_c + (size_t) kRowV * (size_t) E, w.proj_v_sc_t, kProjKV, E, b().xqd, rows, b().yv, kProjKV,
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:593:        ap.k_cache = c.ring ? b().k_stage : c.k;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:594:        ap.v_cache = c.ring ? b().v_stage : c.v;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:609:        aa.k_cache = c.k;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:610:        aa.v_cache = c.v;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:612:        aa.k_chunk = ap.k_cache;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:613:        aa.v_chunk = ap.v_cache;
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:621:        if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
+C:\LLM\rebase\b\src\models\inkling2\prompt.cpp:622:                                  kv_cache_row_bytes(fp8, int8, m_.cache_f4()), strm());   // [F4] one size, both planes
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:319:        const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_f4());
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:767:    size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_f4()); }
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:1232:        mn.kv_cell = (int) cell_bytes();
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:1274:            sg.row0[0] = 0, sg.row0[1] = kRowK, sg.row0[2] = kRowV;
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:1313:        ap.k_cache = c.k;
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:1314:        ap.v_cache = c.v;
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:1328:        aa.k_cache = c.k;
+C:\LLM\rebase\b\src\models\inkling2\session.cpp:1329:        aa.v_cache = c.v;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:189:    constexpr int kRowBytes = F4 ? kKvF4RowBytes : FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:190:    constexpr int kLoads = F4 ? kKvF4RowBytes / 16 : (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:191:    constexpr int kCodeLoads = F4 ? kKvF4CodeBytes / 16 : kLoads;   // F4: four code pieces, the fifth the scales
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:194:    const uint8_t* kbase = static_cast<const uint8_t*>(at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:195:    const uint8_t* vbase = static_cast<const uint8_t*>(at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:198:    constexpr int kVRegs = (F4 || FP8 || INT8) ? kLoads : 1;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:199:    const auto load_k_and_v = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kVRegs], float (&ks)[2], float (&vs)[2]) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:203:        const size_t cell = valid ? (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes : 0;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:208:            for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:211:                for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vp + i, true);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:215:                for (int i = 0; i < kLoads; ++i) vr[i] = __ldg(vp + i);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:223:            for (int i = 0; i < kLoads; ++i) kr[i] = make_uint4(0, 0, 0, 0);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:226:                for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vbase, false);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:230:                for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(0, 0, 0, 0);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:235:    uint4 kr[kLoads];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:276:        for (int i = 0; i < kLoads; ++i) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:321:            for (int i = 0; i < kLoads; ++i) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:329:            for (int i = 0; i < kLoads; ++i) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:442:    const void* k_ptr = segmented ? a.seg.c[seg].k : a.k_cache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:443:    const void* v_ptr = segmented ? a.seg.c[seg].v : a.v_cache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:482:    constexpr int kRowBytes = FP8 ? HD : HD * 2;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:483:    const uint8_t* kbase = static_cast<const uint8_t*>(k_ptr) + (size_t) kvh * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:484:    const uint8_t* vbase = static_cast<const uint8_t*>(v_ptr) + (size_t) kvh * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:500:                const size_t off = (size_t) (key % a.cap) * kKvHeads * kRowBytes + (size_t) d0 * (FP8 ? 1 : 2);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:695:            const size_t offset = ((size_t) cell * kKvHeads + g) * kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:770:            const size_t offset = ((size_t) cell * kKvHeads + g) * kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1018:    const auto* kc = static_cast<const uint8_t*>(batched ? a.seg.c[seg].k : a.k_cache);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1019:    const auto* vc = static_cast<const uint8_t*>(batched ? a.seg.c[seg].v : a.v_cache);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1144:    alignas(16) uint8_t kw[ROWS][kHeadDim * 2];   // the window's rows' keys in the cache's format (fp16 or E4M3)
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1145:    alignas(16) uint8_t vw[ROWS][kHeadDim * 2];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1158:    constexpr int kRowBytes = F4 ? kKvF4RowBytes : FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1159:    constexpr int kLoads = F4 ? kKvF4RowBytes / 16 : (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1160:    constexpr int kCodeLoads = F4 ? kKvF4CodeBytes / 16 : kLoads;   // F4: four code pieces, the fifth the scales
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1171:    const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1172:    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1174:    constexpr int kVRegs = (F4 || FP8 || INT8) ? kLoads : 1;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1175:    uint4 kr[kLoads];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1180:        const size_t cell = (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1184:        for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1187:            for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vp + i, true);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1191:            for (int i = 0; i < kLoads; ++i) vr[i] = __ldg(vp + i);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1199:        for (int i = 0; i < kLoads; ++i) kr[i] = make_uint4(0, 0, 0, 0);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1202:            for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vbase, false);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1206:            for (int i = 0; i < kLoads; ++i) vr[i] = make_uint4(0, 0, 0, 0);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1244:                            void* cache_row = static_cast<uint8_t*>(w ? pa.v_cache : pa.k_cache) +
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1245:                                              ((size_t) (p % pa.cap) * kKvHeads + g) * (size_t) kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1246:                            k4_store_codes(cache_row, lane, vv, sc4);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1255:                        void* cache = w ? pa.v_cache : pa.k_cache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1256:                        const size_t row_bytes = (size_t) kRowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1257:                        void* cache_row = static_cast<uint8_t*>(cache) + ((size_t) (p % pa.cap) * kKvHeads + g) * row_bytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1259:                        for (int u = 0; u < 4; ++u) prep::store_kv(cache_row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1279:            for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1282:                for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(sm.v[w][lane] + 4 * i) = vp[i];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1285:                for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1303:            for (int i = 0; i < kLoads; ++i) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1341:                for (int i = 0; i < kLoads; ++i) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1349:                for (int i = 0; i < kLoads; ++i) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn.cu:1702:    const int64_t bytes_per_segment = max_keys * (2 * kKvHeads * kKvInt8RowBytes);
+C:\LLM\rebase\b\src\models\inkling2\kernels\glue.cu:231:    const uint64_t b1 = (uint64_t) run1 * a.kv_cell, b2 = (uint64_t) run2 * a.kv_cell;
+C:\LLM\rebase\b\src\models\inkling2\kernels\glue.cu:237:        const uint64_t start = i < n1 ? (uint64_t) c0 * a.kv_cell + i * kPiece : (i - n1) * kPiece;
+C:\LLM\rebase\b\src\models\inkling2\kernels\glue.cu:238:        const uint64_t end = i < n1 ? (uint64_t) c0 * a.kv_cell + b1 : b2;
+C:\LLM\rebase\b\src\models\inkling2\kernels\glue.cu:492:        void* cache = w ? (b ? sc.v : a.v_cache) : (b ? sc.k : a.k_cache);
+C:\LLM\rebase\b\src\models\inkling2\kernels\glue.cu:495:        const size_t row_bytes = (size_t) kv_cache_row_bytes(a.fp8, a.int8, a.f4);
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:51:        ink::prep::store_kv(output + (size_t) row * ink::kKvInt8RowBytes, false, true,
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:98:            const size_t row_bytes = (size_t) ink::kv_cache_row_bytes(f.fp8, f.int8), cache = (size_t) cap * ink::kKvHeads * row_bytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:116:                pa.k_ring = kr; pa.v_ring = vr; pa.k_cache = kc; pa.v_cache = vc; pa.cap = cap; pa.fp8 = f.fp8; pa.int8 = f.int8;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:119:                aa.q = q; aa.r = r; aa.sink = sink; aa.rel_table = table; aa.pos = pos; aa.k_cache = kc; aa.v_cache = vc; aa.cap = cap;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:264:constexpr int kCacheCell = ink::kKvHeads * ink::kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:270:        auto* row = bytes.data() + (size_t) i * ink::kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:448:            a.k_cache = swap_kv ? dv : dk;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:449:            a.v_cache = swap_kv ? dk : dv;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:458:                a.k_cache = a.v_cache = nullptr;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:682:        pa.k_ring = dkr; pa.v_ring = dvr; pa.k_cache = dk; pa.v_cache = dv; pa.cap = cap; pa.int8 = true;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:685:        aa.q = dq; aa.r = dr; aa.sink = dsink; aa.rel_table = dtable; aa.pos = dpos; aa.k_cache = dk; aa.v_cache = dv;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:688:        const size_t cells = (size_t) pos0 * ink::kKvHeads * ink::kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:689:        const size_t window = (size_t) rows * ink::kKvHeads * ink::kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kv_int8_parity.cu:759:    constexpr size_t row_bytes = ink::kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:129:size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:402:            a.k_cache = kcache; a.v_cache = vcache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:507:        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:975:            x->k_cache = poisoned(kvb); x->v_cache = poisoned(kvb);
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:983:        bool same = !std::memcmp(host((uint8_t*) a.k_cache, kvb).data(), host((uint8_t*) b.k_cache, kvb).data(), kvb) &&
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:984:                    !std::memcmp(host((uint8_t*) a.v_cache, kvb).data(), host((uint8_t*) b.v_cache, kvb).data(), kvb) &&
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1026:                p.k_ring = dev(kr); p.v_ring = dev(vr); p.k_cache = dev(kc); p.v_cache = dev(vc); p.cap = k.cap;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1031:                a.q = p.q; a.r = p.r; a.sink = p.sink; a.rel_table = dev(table); a.pos = dpos; a.k_cache = p.k_cache; a.v_cache = p.v_cache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1047:                              host((uint8_t*) pa[0].k_cache, kvb) == host((uint8_t*) pa[1].k_cache, kvb) &&
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1048:                              host((uint8_t*) pa[0].v_cache, kvb) == host((uint8_t*) pa[1].v_cache, kvb) &&
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1056:                for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1067:            for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1866:                a.q = p.q; a.r = p.r; a.sink = p.sink; a.rel_table = dev(table); a.pos = p.pos; a.k_cache = p.k_cache; a.v_cache = p.v_cache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1883:                ps[i].k_ring = dev(kr[i]); ps[i].v_ring = dev(vr[i]); ps[i].k_cache = dev(kc[i]); ps[i].v_cache = dev(vc[i]);
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1894:            pb.k_cache = pb.seg.c[0].k; pb.v_cache = pb.seg.c[0].v; pb.k_ring = pb.seg.c[0].k_ring; pb.v_ring = pb.seg.c[0].v_ring;
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1905:                       host((uint8_t*) ps[i].k_cache, kvb) == host((uint8_t*) pb.seg.c[i].k, kvb) &&
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:1906:                       host((uint8_t*) ps[i].v_cache, kvb) == host((uint8_t*) pb.seg.c[i].v, kvb) &&
+C:\LLM\rebase\b\src\models\inkling2\kernels\kernels_parity.cpp:2009:        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:47:    static constexpr int kRowB = F4 ? kKvF4RowBytes : FP8 ? kHeadDim : kKvInt8RowBytes;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:48:    alignas(16) uint8_t k[kKeys][kRowB];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:49:    alignas(16) uint8_t v[kKeys][kRowB];
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:131:        const __half* kc = static_cast<const __half*>(fresh ? a.k_chunk : a.k_cache) + (size_t) kvh * kHeadDim;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:132:        const __half* vc = static_cast<const __half*>(fresh ? a.v_chunk : a.v_cache) + (size_t) kvh * kHeadDim;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:165:        const __half* base = static_cast<const __half*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:174:    constexpr int kRowB = RawKvTile<FP8, F4>::kRowB;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:175:    constexpr int kVecs = kRowB / 16;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:176:    constexpr int kPieces = kKeys * kVecs;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:182:        const uint8_t* kc = static_cast<const uint8_t*>(fresh ? a.k_chunk : a.k_cache) + (size_t) kvh * kRowB;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:183:        const uint8_t* vc = static_cast<const uint8_t*>(fresh ? a.v_chunk : a.v_cache) + (size_t) kvh * kRowB;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:189:                const int j = rem / kVecs, col = (rem - j * kVecs) * 16;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:190:                const size_t off = (size_t) (s0 + (uint32_t) j) * (kKvHeads * kRowB) + col;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:198:                const int j = rem / kVecs, col = (rem - j * kVecs) * 16;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:201:                const size_t off = (size_t) sl * (kKvHeads * kRowB) + col;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:210:        const int j = rem / kVecs, col = (rem - j * kVecs) * 16;
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:216:        const uint8_t* base = static_cast<const uint8_t*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
+C:\LLM\rebase\b\src\models\inkling2\kernels\attn_prompt.cu:217:        const uint8_t* src = base + ((size_t) slot * kKvHeads + kvh) * kRowB + col;
+C:\LLM\rebase\b\src\models\inkling2\kernels\ops.cu:247:            for (int b = kHeadDim + 4; b < kKvInt8RowBytes; b += 4) *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
+C:\LLM\rebase\b\src\models\inkling2\kernels\ops.cu:303:        const size_t row_bytes = (size_t) kv_cache_row_bytes(a.fp8, a.int8, a.f4);
+C:\LLM\rebase\b\src\models\inkling2\kernels\ops.cu:304:        void* cache = which ? a.v_cache : a.k_cache;
+C:\LLM\rebase\b\src\models\inkling2\kernels\ops.cu:544:    constexpr int kVecs = kWidth / 4;
+C:\LLM\rebase\b\src\models\inkling2\kernels\ops.cu:547:            for (int c = threadIdx.x; c < kVecs; c += kRingThreads)
+C:\LLM\rebase\b\src\models\inkling2\kernels\ops.cu:548:                reinterpret_cast<float4*>(x_m)[(size_t) r * kVecs + c] = reinterpret_cast<const float4*>(x)[(size_t) r * kVecs + c];
+C:\LLM\rebase\b\src\models\inkling2\kernels\prep.cuh:169:            for (int b = kHeadDim + 4; b < kKvInt8RowBytes; b += 4) *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_ops.cu:99:__global__ void stage_to_ring_kernel(const uint4* __restrict__ k_stage, const uint4* __restrict__ v_stage, int64_t stage_cap,
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_ops.cu:104:    const uint4* src = (blockIdx.y ? v_stage : k_stage) + (size_t) (p % stage_cap) * n_p;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_ops.cu:157:void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_ops.cu:164:        static_cast<const uint4*>(k_stage), static_cast<const uint4*>(v_stage), stage_cap, static_cast<uint4*>(k_ring),
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:122:size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:220:            a.k_cache = dkc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:221:            a.v_cache = dvc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:223:            a.k_chunk = dks;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:224:            a.v_chunk = dvs;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:283:                d.k_cache = ddk;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:284:                d.v_cache = ddv;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:371:            a.k_cache = dkc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:372:            a.v_cache = dvc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:374:            a.k_chunk = dks;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:375:            a.v_chunk = dvs;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:429:                d.k_cache = ddk;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:430:                d.v_cache = ddv;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:499:            a.k_cache = kc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:500:            a.v_cache = vc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:502:            a.k_chunk = window ? st : kc;
+C:\LLM\rebase\b\src\models\inkling2\kernels\prompt_parity.cpp:503:            a.v_chunk = window ? sv : vc;

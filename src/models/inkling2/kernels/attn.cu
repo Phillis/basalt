@@ -1235,6 +1235,20 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                     if (k >= nr) break;
                     const int rr = rr0 + k;
                     uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
+                    if constexpr (F4) {   // [F4] both planes four-bit; the key is turned once and then stored twice
+                        float vv[4] = {val[k][0] * f[k], val[k][1] * f[k], val[k][2] * f[k], val[k][3] * f[k]};
+                        if (!w) kv4_hadamard128(vv, lane);
+                        const uint32_t sc4 = k4_scales(vv, lane);
+                        k4_store_codes(row, lane, vv, sc4);
+                        if (rr == r) {   // the block's own row: into the cache and the ring
+                            void* cache_row = static_cast<uint8_t*>(w ? pa.v_cache : pa.k_cache) +
+                                              ((size_t) (p % pa.cap) * kKvHeads + g) * (size_t) kRowBytes;
+                            k4_store_codes(cache_row, lane, vv, sc4);
+                            float* ring = w ? pa.v_ring : pa.k_ring;
+                            *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
+                                make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
+                        }
+                    } else {
 #pragma unroll
                     for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
                     if (rr == r) {   // the block's own row: into the cache and the ring
@@ -1246,6 +1260,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                         float* ring = w ? pa.v_ring : pa.k_ring;
                         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
                             make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
+                    }
                     }
                 }
             }
@@ -1311,7 +1326,17 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                 sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
             }
             uint32_t* vrow = sm.v[w][lane];
-            if constexpr (INT8) {
+            if constexpr (F4) {   // [F4] four-bit rows expanded into the same fp16 pairs the fp8 and int8 arms write
+                uint32_t sv[kKvF4Groups];
+                k4_piece_scales(vr[kCodeLoads], sv);
+#pragma unroll
+                for (int i = 0; i < kCodeLoads; ++i) {
+                    uint32_t h[16];
+                    k4_unpack32(vr[i], sv[2 * i], sv[2 * i + 1], h);
+#pragma unroll
+                    for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
+                }
+            } else if constexpr (INT8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) {
                     uint32_t h[8];
@@ -1725,11 +1750,12 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
         cudaFuncSetAttribute(attn_split_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<false, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         set = true;
 
     }
     const bool seg_mode = a.seg.at.n > 0 || a.seg.at_d != nullptr;
-    const bool use_mma = !a.int8;
+    const bool use_mma = !a.int8 && !a.f4;   // [F4] the MMA kernels read 16-byte K/V rows; an NVFP4 row is 80 bytes
     const int mma_z = a.window > 0 ? kWindowMmaSplits : z;
     if (use_mma) {
         const int nseg = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? std::min(rows, (int) bk::kWindowSegsMax) : 1);
@@ -1770,7 +1796,8 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                 if (forced && forced->resident == 0) return false;
                 launch_mma<2>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, forced, info, shards, shard_count);
             }
-        } else if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+        } else if (a.f4) bk::launch_pdl(attn_split_kernel<false, false, false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+        else if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
         else if (a.fp8) bk::launch_pdl(attn_split_kernel<true, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
         else bk::launch_pdl(attn_split_kernel<false, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
     }
@@ -1829,15 +1856,19 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
         cudaFuncSetAttribute(attn_fused_kernel<false, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
         cudaFuncSetAttribute(attn_fused_kernel<true, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
         cudaFuncSetAttribute(attn_fused_kernel<false, true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<false, false, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, false, 3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
     if (rows <= 2) {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        if (a.f4) bk::launch_pdl(attn_fused_kernel<false, false, 2, true>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        else if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
         else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
         else bk::launch_pdl(attn_fused_kernel<false, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
     } else {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        if (a.f4) bk::launch_pdl(attn_fused_kernel<false, false, 3, true>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        else if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
         else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
         else bk::launch_pdl(attn_fused_kernel<false, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
     }
