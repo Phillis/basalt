@@ -330,8 +330,10 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         ss = fmaf(q3, q3, ss);
         ss = warp_sum(ss);
         const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
+        float qf[4] = {q0 * f, q1 * f, q2 * f, q3 * f};
+        if (a.f4) kv4_hadamard128(qf, lane);   // [F4] the queries are turned with the keys - this kernel is the prompt path's writer, prep.cuh's q_heads the decode path's
         *reinterpret_cast<float4*>(a.q + ((size_t) r * kHeads + h) * kHeadDim + i) =
-            make_float4(q0 * f, q1 * f, q2 * f, q3 * f);
+            make_float4(qf[0], qf[1], qf[2], qf[3]);
         // the relative state: 16 values, lanes 0..15
         const float rv = lane < kRel ? yq[kOffR + h * kRel + lane] * a.r_scale[h * kRel + lane] : 0.f;
         const float rs = warp_sum(rv * rv);
@@ -682,6 +684,13 @@ void ctrl_blend(const float* dest, const float* msg, const float* gf, int rows, 
 }
 
 void attn_prepare(const AttnPrep& a, int rows, void* stream) {
+    if (const char* d = std::getenv("BASALT_DIAG_KV"); d && *d == '1') {
+        static int said = 0;
+        if (said++ % 500 == 0)
+            std::fprintf(stderr, "KVDIAG %s f4=%d fp8=%d int8=%d rows=%d cap=%lld rb=%d %s\n",
+                         "attn_prepare", (int) a.f4, (int) a.fp8, (int) a.int8, rows, (long long) a.cap,
+                         (int) kv_cache_row_bytes(a.fp8, a.int8, a.f4), "");
+    }
     if (rows <= 0) return;
     cudaStream_t s = (cudaStream_t) stream;
     attn_prepare_kernel<<<rows, kThreads, 0, s>>>(a);

@@ -4451,3 +4451,28 @@ After it: `window nvfp4` max rel **1.125e-03** and `full nvfp4` 7.986e-04 - all 
 
 Also in this commit: `prompt_parity`'s `report()` prints the worst nine entries when it fails, so the next failure names
 itself instead of needing a debugger.
+
+## Session 68 - NVFP4 WORKS: the prompt path's queries were never turned (second root cause), needles 3/3 at 64k and 120k
+
+With the window-pipeline guard fixed the engine stopped faulting, but retrieval was still empty: at 841 tokens the model
+answered "filler filler ..." instead of a passphrase two notes in, while **fp8 on the same build recalled it at 11,201
+tokens**. A `BASALT_DIAG_KV` print at the three host entries showed every stage seeing `f4=1 ... rb=80`, so the flags
+were right - and that left the one asymmetry the prints cannot show.
+
+**The prompt path has its own query code.** `ops.cu`'s `attn_prepare_kernel` (what `attn_prepare` launches - the prompt
+writer) computes the clipped query itself at L321-334, a second implementation beside `prep.cuh`'s `q_heads` (which serves
+the decode path and the fused kernel). I had added the 128-point rotation to `q_heads` only, so in the prompt:
+
+  keys -> turned, queries -> **not turned** -> (H k) . q for every score
+
+The prompt's own hidden states were therefore noise, and since every stored K/V row is computed from those states, the
+decode had correct (turned) queries against noise. That is exactly the symptom: fluent, high-probability filler and no
+recall, at any depth.
+
+Fix: `if (a.f4) kv4_hadamard128(qf, lane);` at that site as well, after the clip factor.
+
+Result:
+- passphrase recall: 841 tokens **ZEBRA-42**, 11,201 tokens (fact at the end) **ZEBRA-42**
+- **needles 3/3 at 64,000 tokens** (with a concurrent decoder in the other slot)
+- **needles 3/3 at 120,000 tokens**
+- no crash, engine alive throughout, 2 x 128k, `cuda0=3.6 GiB ram=11.6 GiB`
