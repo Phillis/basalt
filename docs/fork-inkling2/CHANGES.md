@@ -4243,3 +4243,27 @@ reserve sweep (`vram-reserve-mib` 256 -> 512 -> 768, which pulls experts back of
 if the crash follows the card occupancy rather than the format, the codec is innocent.
 
 Still owed: parity (spec 5, including `kv_f4_parity`), the `BASALT_DIAG_KV` bounds assertion, and gates 1-5.
+
+## Session 67 - NVFP4 K/V: the first runs say the port is numerically wrong, not just crashy
+
+Two things were measured after Item 3, both on `nvfp4-kv` (`27fac431`), and one hypothesis was killed:
+
+1. **`vram-reserve-mib` 768 does not help**: plan `cuda0=3.1GiB ram=12.1GiB`, and the engine still ends at the 64k
+   needle. Placement (nvfp4's 1.5 GiB of freed VRAM putting more expert copies on the card) is therefore **not** the
+   cause - the first run's crash at reserve 256 and this one fail the same way.
+2. **The output is wrong before it crashes.** At a 5k needle the model answered `!!!!!!...` - a garbage generation, not
+   a wrong fact. So this is a *numerical* defect in the F4 path (writers, loaders or the transform), and the crash at
+   longer depths is likely the same defect running off the end of something. Gate 0 answering 391/Tokyo/planets is
+   exactly the false confidence the spec warned about.
+3. **A measurement artefact to remember**: four stale `serve.server` processes from earlier starts were fighting for
+   port 8080, and their competing engines ran the machine out of RAM ("RAM ran out loading (640 MiB free)"), which shows
+   up as HTTP 503 at *every* depth. The 503s in the first sweep were that, not the format. Any arm must start from zero
+   `basalt.exe` + `serve.server` processes and >24 GiB free.
+
+Next, and this is the spec's own order: **Item 5 (parity) before any further run.** `kv_f4_parity` plus the f4 cases in
+`kernels_parity`/`prompt_parity` would localise a codec defect in minutes - the writer against a host reference of the
+codec, the decode attention against the fp32 reference, and the identity that matters: a rotated query against a rotated
+cache must give the unrotated fp32 pair's scores. Suspects, in the order the parity cases would test them: the nibble
+order in `k4_store_codes` against `kv4_decode8`'s (value 2i in the low nibble), `k4_scales`' two-lane group reduction,
+`k4_unpack32`'s group-to-scale mapping (u.x,u.y = group 2i, u.z,u.w = group 2i+1), and whether every key-writing site
+really turns its row while every query site turns the query once.
