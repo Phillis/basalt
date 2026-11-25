@@ -479,7 +479,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
         if (has_next) asm volatile("cp.async.wait_group 1;\n" ::: "memory");
         else asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         __syncthreads();
-        if constexpr (FP8 || INT8) {
+        if constexpr (FP8 || INT8 || F4) {
             unpack_raw_tile<FP8, F4>(sm.near_q.raw[cur], sm.near_q.kt, tid);
             __syncthreads();
         }

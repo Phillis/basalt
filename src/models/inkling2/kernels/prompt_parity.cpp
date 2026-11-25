@@ -13,6 +13,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/kernels/kv4.cuh"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/kernels/window_gemm.hpp"
@@ -80,6 +81,13 @@ void report(const char* what, const std::vector<float>& got, const std::vector<d
     const double rel = max_abs / std::max(max_ref, 1e-30);
     const bool ok = rel <= tol && std::isfinite(max_abs);
     std::printf("%-44s max abs %.3e  max rel %.3e  %s\n", what, max_abs, rel, ok ? "ok" : "FAIL");
+    if (!ok) {   // the worst entries, so a failure names itself
+        size_t worst = 0;
+        for (size_t i = 0; i < got.size(); ++i)
+            if (std::fabs(got[i] - ref[i]) > std::fabs(got[worst] - ref[worst])) worst = i;
+        for (size_t k = (worst >= 4 ? worst - 4 : 0), n = 0; k < got.size() && n < 9; ++k, ++n)
+            std::printf("      [%zu] got %+.6f  ref %+.6f  d %+.3e\n", k, got[k], ref[k], got[k] - ref[k]);
+    }
     failures += !ok;
 }
 void report(const char* what, const std::vector<float>& got, const std::vector<float>& ref, double tol) {
@@ -118,13 +126,37 @@ double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 // ---- attention -----------------------------------------------------------------------------------------------------------
 
 // The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8).
-enum Kv { kF16, kE4M3, kI8 };
-size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8, false); }
-const char* kv_name(Kv kv) { return kv == kE4M3 ? "e4m3" : kv == kI8 ? "int8" : "fp16"; }
+enum Kv { kF16, kE4M3, kI8, kF4 };
+size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8, kv == kF4); }
+const char* kv_name(Kv kv) { return kv == kE4M3 ? "e4m3" : kv == kI8 ? "int8" : kv == kF4 ? "nvfp4" : "fp16"; }
 // One head row of kHeadDim values `x` written in format kv to `row` (kv_bytes(kv) bytes); `got` takes the values the row
 // holds. INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even.
+int e2m1_code(double v) {   // kv4_e2m1_code's thresholds, on the host
+    const double a = std::fabs(v);
+    const int m = a <= 0.25 ? 0 : a < 0.75 ? 1 : a <= 1.25 ? 2 : a < 1.75 ? 3 : a <= 2.5 ? 4 : a < 3.5 ? 5 : a <= 5.0 ? 6 : 7;
+    return (v < 0 ? 8 : 0) | m;
+}
+double e2m1_value(int c) {
+    static const double mag[8] = {0, 0.5, 1, 1.5, 2, 3, 4, 6};
+    return (c & 8 ? -1.0 : 1.0) * mag[c & 7];
+}
 void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
-    if (kv == kI8) {
+    if (kv == kF4) {   // E2M1 codes, one E4M3 scale per 16 values (scale = amax / 6, codes against its decode)
+        for (int grp = 0; grp < kKvF4Groups; ++grp) {
+            double m = 0;
+            for (int d = grp * kKvF4Group; d < grp * kKvF4Group + kKvF4Group; ++d) m = std::max(m, (double) std::fabs(x[d]));
+            const __nv_fp8_e4m3 sq((float) (std::max(m, 6.0 * 0.001953125) / 6.0));
+            const float s = (float) sq;
+            row[kKvF4CodeBytes + grp] = sq.__x;
+            for (int d = grp * kKvF4Group; d < grp * kKvF4Group + kKvF4Group; ++d) {
+                const int c = e2m1_code(s > 0.f ? x[d] / s : 0.f);
+                if ((d & 1) == 0) row[d / 2] = (uint8_t) (c & 0xF);
+                else row[d / 2] |= (uint8_t) ((c & 0xF) << 4);
+                got[d] = e2m1_value(c) * (double) s;
+            }
+        }
+        for (int b = kKvF4CodeBytes + kKvF4Groups; b < kKvF4RowBytes; ++b) row[b] = 0;
+    } else if (kv == kI8) {
         for (int grp = 0; grp < 2; ++grp) {
             float m = 0.f;
             for (int d = grp * 64; d < grp * 64 + 64; ++d) m = std::max(m, std::fabs(x[d]));
@@ -187,7 +219,7 @@ struct KeyBank {
 };
 
 void test_attention_prompt() {
-    for (const Kv kv : {kF16, kE4M3, kI8})
+    for (const Kv kv : {kF16, kE4M3, kI8, kF4})
         for (const bool window : {true, false}) {
             const int R = 300;
             const int64_t pos0 = window ? 2500 : 3000;
@@ -225,6 +257,7 @@ void test_attention_prompt() {
             a.chunk_cap = window ? stage_cap : full_cap;
             a.fp8 = kv == kE4M3;
             a.int8 = kv == kI8;
+            a.f4 = kv == kF4;
             a.window = window ? kExtent : 0;
             attention_prompt(a, R, out, S);
             const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
@@ -339,7 +372,7 @@ void test_attention_prompt() {
         }
     // long-context correctness: a 2,048-row chunk across the 4-stage far-tile pipeline and LPT tile order, in each format,
     // with non-wrapping cache capacities against CPU FP64, attention_decode (all 2,048 rows), and sub-chunk invariance
-    for (const Kv kv : {kF16, kE4M3, kI8})
+    for (const Kv kv : {kF16, kE4M3, kI8, kF4})
         for (const bool window : {true, false}) {
             const int R = 2048;
             const int sub = 137;
@@ -376,6 +409,7 @@ void test_attention_prompt() {
             a.chunk_cap = window ? stage_cap : full_cap;
             a.fp8 = kv == kE4M3;
             a.int8 = kv == kI8;
+            a.f4 = kv == kF4;
             a.window = window ? kExtent : 0;
             attention_prompt(a, R, out, S);
             const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
@@ -478,7 +512,7 @@ void test_attention_prompt() {
         }
     if (g_no_bench) return;
     // timing: a 2,048-row chunk of a window layer, and of a full layer after 8K, 32K and 128K positions, in each format
-    for (const Kv kv : {kF16, kE4M3, kI8})
+    for (const Kv kv : {kF16, kE4M3, kI8, kF4})
         for (const int64_t ctx : {(int64_t) 0, (int64_t) 8192, (int64_t) 32768, (int64_t) 131072}) {
             const int R = 2048;
             const bool window = ctx == 0;
@@ -504,6 +538,7 @@ void test_attention_prompt() {
             a.chunk_cap = window ? R : cap;
             a.fp8 = kv == kE4M3;
             a.int8 = kv == kI8;
+            a.f4 = kv == kF4;
             a.window = window ? kExtent : 0;
             const double us = time_us([&] { attention_prompt(a, R, out, S); }, 10);
             double pairs = 0;   // (query, key) pairs
@@ -527,7 +562,7 @@ void test_attention_prompt() {
 // A chunk's staged rows into the window ring (stage_to_ring): the last `keep` positions of the chunk, cell for cell, in each
 // format, past the ring's wrap; the ring's other cells untouched.
 void test_stage_to_ring() {
-    for (const Kv kv : {kF16, kE4M3, kI8}) {
+    for (const Kv kv : {kF16, kE4M3, kI8, kF4}) {
         const int R = 3000, keep = kExtent;
         const int64_t pos0 = 5000, stage_cap = 4096, ring_cap = kExtent + 8;
         KeyBank kb;

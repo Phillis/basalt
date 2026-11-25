@@ -4426,3 +4426,28 @@ Next session, in this order, all one run each:
    the codec is innocent and the split-at-depth plumbing is the bug.
 
 Machine left clean: live engine on `pr650-int` (verified `391`), `nvfp4-kv` at 12 commits past `bf330c03`, nothing pushed.
+
+## Session 68 - NVFP4 ROOT CAUSE (the one that mattered): the window pipeline never unpacked an NVFP4 tile
+
+`attn_prompt.cu` L482, the near/window pipeline:
+
+    if constexpr (FP8 || INT8) {
+        unpack_raw_tile<FP8, F4>(sm.near_q.raw[cur], sm.near_q.kt, tid);
+        __syncthreads();
+    }
+
+**`F4` was missing from the guard**, so on every sliding-window layer the raw tile was loaded and never expanded: `sm.near_q.kt`
+kept whatever the union held (zeros), every score came out zero and every output row came out exactly 0. Sliding-window
+layers are 2 of every 3 in Inkling 2, so the model's hidden state was garbage after the first layer - which is why the
+symptoms looked like they had nothing to do with the codec: wrong attention values change *which experts route*, and the
+router then indexes its table with junk (the review session's `blob_table[x]` note), so the fault surfaced in
+`router_select_plan`, `native MMVQ`, `expert_prefetch`, `sample_tokens` - in whatever launch came next - and the addresses
+were fine all along.
+
+Found with the F4 case this session added to `prompt_parity` (an NVFP4 encoder on the host plus `a.f4`):
+`attention_prompt window nvfp4` produced **got = 0.000000 for every entry** while the reference was non-zero, i.e. the
+signature of a tile that decoded to all zeros (an E4M3 scale of 0), not of a wrong address. Fix: `FP8 || INT8 || F4`.
+After it: `window nvfp4` max rel **1.125e-03** and `full nvfp4` 7.986e-04 - all four formats, both paths, **0 failures**.
+
+Also in this commit: `prompt_parity`'s `report()` prints the worst nine entries when it fails, so the next failure names
+itself instead of needing a debugger.
