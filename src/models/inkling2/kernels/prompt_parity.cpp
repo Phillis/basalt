@@ -145,14 +145,39 @@ void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
         for (int grp = 0; grp < kKvF4Groups; ++grp) {
             double m = 0;
             for (int d = grp * kKvF4Group; d < grp * kKvF4Group + kKvF4Group; ++d) m = std::max(m, (double) std::fabs(x[d]));
-            const __nv_fp8_e4m3 sq((float) (std::max(m, 6.0 * 0.001953125) / 6.0));
+            // two candidate scales, the smaller squared error wins (the device's k4_scales does exactly this)
+            const auto enc = [&](float sc, std::vector<double>& out) {
+                float err = 0.f;
+                for (int d = grp * kKvF4Group; d < grp * kKvF4Group + kKvF4Group; ++d) {
+                    const int c = e2m1_code(sc > 0.f ? x[d] / sc : 0.f);
+                    const double q = e2m1_value(c) * (double) sc;
+                    err += (float) ((x[d] - q) * (x[d] - q));
+                    out[(size_t) (d - grp * kKvF4Group)] = q;
+                }
+                return err;
+            };
+            const float cands[4] = {1.0f, 0.9f, 0.8f, 0.7f};
+            float best_e = 1e30f;
+            __nv_fp8_e4m3 sq(0.f);
+            std::vector<double> best_g(kKvF4Group);
+            for (int c = 0; c < 4; ++c) {
+                const __nv_fp8_e4m3 qc((float) (cands[c] * std::max(m, 6.0 * 0.001953125) / 6.0));
+                std::vector<double> gc(kKvF4Group);
+                const float e = enc((float) qc, gc);
+                if (e < best_e) {
+                    best_e = e;
+                    sq = qc;
+                    best_g = gc;
+                }
+            }
             const float s = (float) sq;
+            std::vector<double>& pick = best_g;
             row[kKvF4CodeBytes + grp] = sq.__x;
             for (int d = grp * kKvF4Group; d < grp * kKvF4Group + kKvF4Group; ++d) {
                 const int c = e2m1_code(s > 0.f ? x[d] / s : 0.f);
                 if ((d & 1) == 0) row[d / 2] = (uint8_t) (c & 0xF);
                 else row[d / 2] |= (uint8_t) ((c & 0xF) << 4);
-                got[d] = e2m1_value(c) * (double) s;
+                got[d] = pick[(size_t) (d - grp * kKvF4Group)];
             }
         }
         for (int b = kKvF4CodeBytes + kKvF4Groups; b < kKvF4RowBytes; ++b) row[b] = 0;

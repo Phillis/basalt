@@ -6,8 +6,11 @@
 //
 // Row layout (80 bytes, 16-byte aligned):
 //   [0..63]   128 E2M1 codes, two a byte, value 2i in byte i's low nibble
-//   [64..71]  one E4M3 scale byte per 16 values (group g covers values 16g..16g+15)
-//   [72..79]  zero (padding to the key row's 80 bytes)
+//   [64..79]  one E4M3 scale byte per 8 values (group g covers values 8g..8g+7) - the row exactly full
+//
+// Eight values a scale rather than sixteen: the same 80 bytes (the eight bytes that used to be padding hold the second
+// half of the scales), the same read cost, half the group's amax range to lose, which is what a four-bit plane's error is
+// dominated by.
 //
 // The scale's rounding is the dense stack's: scale = E4M3(amax / 6), codes = E2M1(v / decode(scale)) - see
 // basalt/kernels/kv_fp4.cuh, whose helpers this file reuses so both stacks round identically.  Device inlines only.
@@ -24,9 +27,9 @@
 namespace basalt::models::inkling2 {
 
 constexpr int kKvF4CodeBytes = 64;                   ///< 128 four-bit codes
-constexpr int kKvF4Group = 16;                       ///< values one E4M3 scale byte covers
-constexpr int kKvF4Groups = 8;                       ///< scale bytes a row
-constexpr int kKvF4Pairs = 4;                        ///< lanes a group spans (four values a lane)
+constexpr int kKvF4Group = 8;                        ///< values one E4M3 scale byte covers
+constexpr int kKvF4Groups = 16;                      ///< scale bytes a row (64 code bytes + 16 scales = 80)
+constexpr int kKvF4Pairs = 2;                        ///< lanes a group spans (four values a lane)
 constexpr float kKvF4InvSqrt128 = 0.08838834764831845f;   // 1/sqrt(128)
 
 #if defined(__CUDACC__)
@@ -56,14 +59,36 @@ __device__ __forceinline__ void kv4_hadamard128(float (&v)[4], int lane) {
     for (int j = 0; j < 4; ++j) v[j] *= kKvF4InvSqrt128;
 }
 
-/// The group's E4M3 scale byte: the largest magnitude over the four lanes of the group (lanes 4g..4g+3, shfl masks 1
-/// and 2), floored and divided by 6 as the dense path does.  Every lane of the group returns the same byte.
+/// The group's E4M3 scale byte.  Two candidates are measured - amax / 6, the largest code exactly on the group's peak,
+/// and 0.9 x that, which spends a little headroom to shrink the step for the other seven values - and the group keeps
+/// whichever leaves the smaller squared error.  Free at read time (the byte says which was used), a handful of flops
+/// per 8 values at write time.  Every lane of the group returns the same byte.
 __device__ __forceinline__ uint32_t k4_scales(const float (&v)[4], int lane) {
     float a = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
-    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 2));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));   // two lanes a group: 8 values
     (void) lane;
-    return basalt::kernels::kv4_group_scale(a);
+    // four candidates: the peak exactly on code 6, and three that spend some of the peak's range on the other seven
+    // values (an outlier-heavy group wants the smaller step far more than it wants its maximum represented)
+    constexpr float kCand[4] = {1.0f, 0.9f, 0.8f, 0.7f};
+    uint32_t best = 0;
+    float best_e = 1e30f;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const uint32_t byte = basalt::kernels::kv4_group_scale(a * kCand[c]);
+        const float s = basalt::kernels::kv4_e4m3_value(byte);
+        float e = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float q = basalt::kernels::kv4_e2m1_value14(basalt::kernels::kv4_group_code(v[j], s)) * (s * 16384.0f);
+            e += (v[j] - q) * (v[j] - q);
+        }
+        e += __shfl_xor_sync(0xffffffffu, e, 1);   // the group's total, in both lanes
+        if (e < best_e) {
+            best_e = e;
+            best = byte;
+        }
+    }
+    return best;
 }
 
 /// The lane's four values against a decoded group scale: two code bytes at lane * 2, and, for the group's first lane,
@@ -77,8 +102,7 @@ __device__ __forceinline__ void k4_store_codes(void* row, int lane, const float 
         const uint32_t hi = basalt::kernels::kv4_group_code(v[2 * b + 1], s);
         p[lane * 2 + b] = (uint8_t) (lo | (hi << 4));
     }
-    if ((lane & (kKvF4Pairs - 1)) == 0) p[kKvF4CodeBytes + lane / kKvF4Pairs] = (uint8_t) scale_byte;
-    if (lane == 0) *reinterpret_cast<uint64_t*>(p + kKvF4CodeBytes + kKvF4Groups) = 0ull;   // bytes 72..79: padding, zeroed
+    if ((lane & (kKvF4Pairs - 1)) == 0) p[kKvF4CodeBytes + lane / kKvF4Pairs] = (uint8_t) scale_byte;   // lanes 0, 2, 4, ... write 16
 }
 
 /// A key row: the 128-point transform, then the group scale, then the codes at lane * 2.
@@ -94,9 +118,9 @@ __device__ __forceinline__ void store_v4nv(void* row, int lane, const float (&v)
 
 /// The eight scale bytes of a row whose scales piece is already in registers (a loader reads bytes 64..79 as one uint4).
 __device__ __forceinline__ void k4_piece_scales(const uint4 u, uint32_t (&s)[kKvF4Groups]) {
-    const uint32_t w[2] = {u.x, u.y};
+    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 4; ++i)
 #pragma unroll
         for (int j = 0; j < 4; ++j) s[4 * i + j] = (w[i] >> (8 * j)) & 0xFFu;
 }
@@ -113,19 +137,19 @@ __device__ __forceinline__ void k4_row_scales(const uint8_t* row, uint32_t (&s)[
     }
 }
 
-/// 32 fp16 values from one 16-byte code piece (32 codes = two groups) and their two scale bytes.
-__device__ __forceinline__ void k4_unpack32(const uint4 u, uint32_t s0, uint32_t s1, uint32_t (&h)[16]) {
-    const uint4 a = basalt::kernels::kv4_decode8(u.x, s0), b = basalt::kernels::kv4_decode8(u.y, s0);
-    const uint4 c = basalt::kernels::kv4_decode8(u.z, s1), d = basalt::kernels::kv4_decode8(u.w, s1);
+/// 32 fp16 values from one 16-byte code piece (32 codes = four groups of eight) and their four scale bytes, s[0..3].
+__device__ __forceinline__ void k4_unpack32(const uint4 u, const uint32_t* s, uint32_t (&h)[16]) {
+    const uint4 a = basalt::kernels::kv4_decode8(u.x, s[0]), b = basalt::kernels::kv4_decode8(u.y, s[1]);
+    const uint4 c = basalt::kernels::kv4_decode8(u.z, s[2]), d = basalt::kernels::kv4_decode8(u.w, s[3]);
     h[0] = a.x; h[1] = a.y; h[2] = a.z; h[3] = a.w;
     h[4] = b.x; h[5] = b.y; h[6] = b.z; h[7] = b.w;
     h[8] = c.x; h[9] = c.y; h[10] = c.z; h[11] = c.w;
     h[12] = d.x; h[13] = d.y; h[14] = d.z; h[15] = d.w;
 }
 
-/// 16 fp16 values from one 8-byte code piece (16 codes = one group) and its scale byte.
-__device__ __forceinline__ void k4_unpack16(const uint2 u, uint32_t s, uint32_t (&h)[8]) {
-    const uint4 a = basalt::kernels::kv4_decode8(u.x, s), b = basalt::kernels::kv4_decode8(u.y, s);
+/// 16 fp16 values from one 8-byte code piece (16 codes = two groups of eight) and their two scale bytes.
+__device__ __forceinline__ void k4_unpack16(const uint2 u, uint32_t s0, uint32_t s1, uint32_t (&h)[8]) {
+    const uint4 a = basalt::kernels::kv4_decode8(u.x, s0), b = basalt::kernels::kv4_decode8(u.y, s1);
     h[0] = a.x; h[1] = a.y; h[2] = a.z; h[3] = a.w;
     h[4] = b.x; h[5] = b.y; h[6] = b.z; h[7] = b.w;
 }

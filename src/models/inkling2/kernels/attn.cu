@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
 #pragma unroll
             for (int i = 0; i < kCodeLoads; ++i) {
                 uint32_t h[16];
-                k4_unpack32(kr[i], sk[2 * i], sk[2 * i + 1], h);
+                k4_unpack32(kr[i], &sk[4 * i], h);
 #pragma unroll
                 for (int d = 0; d < 16; ++d) {
                     const float2 fv = __half22float2(*reinterpret_cast<const __half2*>(&h[d]));
@@ -312,7 +312,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
 #pragma unroll
             for (int i = 0; i < kCodeLoads; ++i) {
                 uint32_t h[16];
-                k4_unpack32(vr[i], sv[2 * i], sv[2 * i + 1], h);
+                k4_unpack32(vr[i], &sv[4 * i], h);
 #pragma unroll
                 for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
             }
@@ -1332,7 +1332,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
                 for (int i = 0; i < kCodeLoads; ++i) {
                     uint32_t h[16];
-                    k4_unpack32(vr[i], sv[2 * i], sv[2 * i + 1], h);
+                    k4_unpack32(vr[i], &sv[4 * i], h);
 #pragma unroll
                     for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
                 }

@@ -231,7 +231,8 @@ __device__ __forceinline__ void unpack_raw_tile(const RawKvTile<FP8, F4>& rt, Kv
         uint32_t h[8];
         if constexpr (F4) {   // [F4] 16 values = eight code bytes and their group's scale byte
             const uint2 u2 = *reinterpret_cast<const uint2*>(rptr + col / 2);
-            k4_unpack16(u2, (uint32_t) rptr[kKvF4CodeBytes + col / kKvF4Group], h);
+            k4_unpack16(u2, (uint32_t) rptr[kKvF4CodeBytes + col / kKvF4Group],
+                        (uint32_t) rptr[kKvF4CodeBytes + col / kKvF4Group + 1], h);
         } else if constexpr (FP8) {
             const uint4 u = *reinterpret_cast<const uint4*>(rptr + col);
             const uint32_t w[4] = {u.x, u.y, u.z, u.w};

@@ -4588,3 +4588,43 @@ Plan `cuda0=2.3 GiB ram=12.9 GiB` with `kv fp8`, one slot, 262,144 context; prof
 A 172,001-token prompt with the passphrase at note 2: **ZEBRA-42 recalled**, ~1,660 t/s prefill (103.6 s end to end),
 ~58 t/s decode (9 tokens in 154 ms, 6 of 6 drafts accepted), hit 68%. `kv nvfp4` also fits at 256k but its KLD is 2.3x
 fp8's, so fp8 is the format for this workload too.
+
+## Session 68 - the fair comparison, warm on both sides
+
+Our tree re-measured with the same warm protocol (its earlier 46.2 / 44.9 were cold first runs): decode **46.8 / 44.3 /
+43.1 / 44.8** and prefill 1,840 / 1,558 / 1,375 / 1,245 at 30k / 64k / 96k / 120k. The merged base with fp8 and chunk 4096
+does **55.8 / 55.2 / 51.7 / 51.1** decode (level prefill at depth), and with chunk 5120 it does **2,006 / 1,781 / 1,563 /
+1,435** prefill (decode 37.7 / 51.3 / 49.6 / 48.5). So the merged base wins decode at every depth and prefill at every depth
+once the chunk is 5,120; only 30k decode prefers the smaller chunk. Quality is 2x better there as well (0.00586 against
+0.01193).
+
+## Session 68 - NVFP4's two free numerics levers: one scale per 8 values, and an MSE-chosen scale
+
+Both were the review session's suggestions, both cost nothing at read time, and together they change the verdict.
+
+1. **One E4M3 scale per 8 values instead of 16.** The row was 64 code bytes + 8 scale bytes + 8 padding; sixteen scale
+   bytes fill it exactly, so the memory and the read cost are identical and each group's amax range is halved. Sites:
+   `kKvF4Group` 16 -> 8, `kKvF4Groups` 8 -> 16, `kKvF4Pairs` 4 -> 2, `k4_scales` (one shfl instead of two), the scale
+   byte at `64 + lane/2` (lanes 0, 2, 4, ...), `k4_piece_scales` reads all sixteen bytes, `k4_unpack32` takes four scale
+   bytes (one per 8-value code word) and `k4_unpack16` two, the prompt path's decode reads both of its group's bytes, and
+   the padding write is gone because there is no padding.
+2. **An MSE-chosen scale.** The writer measures four candidates - amax/6 (the peak exactly on code 6), 0.9, 0.8 and
+   0.7 of it - and keeps whichever leaves the group's smallest squared error. The byte records the choice, so the reader
+   needs nothing new. The parity harness's host encoder makes the same choice in float, which is what proves the two agree
+   (0 failures).
+
+Measured on the public base, 100 chunks, T=3, same build, same machine:
+
+| codec | KLD mean | median | p99 | top-1 |
+|---|---|---|---|---|
+| group 16, amax/6 | 0.01374 | 0.00674 | 0.1153 | 95.04% |
+| group 8, amax/6 | 0.01214 | 0.00576 | 0.1051 | 95.23% |
+| **group 8, MSE (2 candidates)** | **0.01135** | 0.00550 | 0.0965 | 95.34% |
+| **group 8, MSE (4 candidates)** | **0.01132** | 0.00545 | 0.0939 | **95.42%** |
+| fp8v4 (the live default) | 0.01193 | 0.00581 | 0.0998 | 95.33% |
+| fp8 | 0.00586 | 0.00282 | 0.0502 | 96.80% |
+
+**-17.6% KLD for zero bytes and zero read cost**, and NVFP4 is now *better* than fp8v4 on KLD mean, median, p99 and top-1 -
+which was the review session's bar for calling it the better four-bit format (it returns 1.47 GiB at two 128k slots
+against fp8v4's 0.75, and its prefill was +8%). It still does not pass the strict gate (fp8 + 0.0010 = 0.00699), so the
+choice between "four-bit" and "eight-bit" remains Phil's, but the four-bit option is no longer the worse one.
