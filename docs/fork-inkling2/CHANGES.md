@@ -4523,3 +4523,21 @@ Phil is the one the spec named - merged base with `fp8` (best quality of any 2-s
 nvfp4's) and a KV that is 3.16 GiB against fp8's 3.9. The three bugs found today are exactly what that port needs:
 the decode window's missing format flags, the window pipeline's missing unpack for a four-bit value plane, and the prompt
 path's *second* query implementation in `ops.cu` that has to turn the query too.
+
+## Session 68 - --prompt-chunk ported to the merged base, and the prefill/decode trade measured there
+
+Port of our tree's runtime flag (`inline int kPromptChunk`, `--prompt-chunk N`, 2,048..16,384), default **4,096** = exactly
+today's behaviour, so the port alone changes nothing.
+
+Measured on this base, `kv fp8`, 2 x 128k, reserve 256, two 30k prompts and the curve:
+
+| chunk | two 30k prompts (per stream) | prefill 30k / 64k | decode 30k / 64k | plan |
+|---|---|---|---|---|
+| **4,096** (default) | 1,138 t/s | 1,750 / 1,604 | **40.1 / 51.7** | cuda0 2.1 / ram 13.1 |
+| **5,120** | **1,336 t/s (+17%)** | **2,060 (+18%) / 1,795 (+12%)** | 36.8 (−8%) / 47.9 (−7%) | cuda0 1.8 / ram 13.4 |
+| 8,192 | **does not fit**: "the card is 450 MiB short" | - | - | - |
+
+So the trade is the same one our tree found: a bigger chunk amortises the staging passes (prefill up) but its staging
+buffers take the card room the expert copies want (decode down). 8,192 is out of reach for fp8 at two 128k slots
+(its staging is twice nvfp4's, which is why the four-bit formats could use it). 4,096 stays the default - decode-first,
+which is what a chat/agent stream spends its time in - and 5,120 is the flag's recommendation for prefill-heavy use.

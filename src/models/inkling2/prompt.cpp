@@ -37,7 +37,7 @@ namespace fp4 = basalt::prefill::fp4;
 namespace mxfp8 = basalt::prefill::mxfp8;
 namespace q8 = basalt::prefill::q8;
 
-constexpr int kChunk = kPromptChunk;       // rows of one chunk forward
+const int& kChunk = kPromptChunk;          // [prefill] from --prompt-chunk, read at every use
 constexpr int kTypeBF16 = 30;
 constexpr int kTypeNvfp4 = 40;
 constexpr int kTypeMxfp8 = 46;

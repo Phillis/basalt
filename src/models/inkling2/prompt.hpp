@@ -17,7 +17,10 @@ namespace basalt::models::inkling2 {
 class DsparkHook;
 
 /// The most rows one prompt chunk runs (the drafter's tap holds as many).
-constexpr int kPromptChunk = 4096;
+/// [prefill] Rows of one prompt chunk, set by --prompt-chunk (default 4,096). Prefill is governed by the number of spill
+/// staging passes, ceil(tokens / chunk), more than by a chunk's own size, so a bigger chunk amortises the staging
+/// (measured on pr650-int: 8,192 gave +43% prefill over 4,096 at one slot; 5,120 was the two-slot trade).
+inline int kPromptChunk = 4096;
 
 class PromptRunner {
 public:

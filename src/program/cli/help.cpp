@@ -162,6 +162,8 @@ void usage() {
                  "  --draft-log FILE     one line per decode window for draft-policy study\n"
                  "  --force-zero-doorbell  TEST: every decode window on the zero-doorbell graph; the routed\n"
                  "                       experts not in VRAM drop out, so the output is wrong (serve path)\n"
+                 "  --prompt-chunk N     [inkling2] rows of one prompt chunk (default 4096): more rows amortise the\n"
+                 "                       spill staging's passes; 8192 is the prefill-first choice, 5120 the two-slot one\n"
                  "  --ppl-base FILE      llama.cpp KL-divergence base for ppl= requests\n"
                  "  --ppl-out FILE       where ppl= requests write their per-row lines\n"
                  "  --gpu-stages         capture the layer as three graphs (mixer / ffn+router / post)\n"

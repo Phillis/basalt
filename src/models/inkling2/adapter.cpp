@@ -9,6 +9,7 @@
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/meta.hpp"
 #include "models/inkling2/model.hpp"
+#include "models/inkling2/prompt.hpp"   // [prefill] kPromptChunk
 
 #include <cstdlib>
 
@@ -54,6 +55,11 @@ public:
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
+            return true;
+        }
+        if (a == "--prompt-chunk") {   // [prefill] rows of one prompt chunk; below 2,048 the FP4 planes abort
+            const int v = std::atoi(args.next("--prompt-chunk"));
+            if (v >= 2048) kPromptChunk = std::min(16384, v);
             return true;
         }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
