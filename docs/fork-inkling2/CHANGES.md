@@ -4377,3 +4377,19 @@ After the fix the decode runs the F4 arms for the first time, and the failure mo
 the next launch, i.e. some earlier kernel now faults). Next: `CUDA_LAUNCH_BLOCKING=1` to name it, then the spec's S1
 (the split decode kernel, which NVFP4 is the first format to run at depth in production - fp8/fp16 always take the MMA
 path, int8 from kMmaMinKeys up).
+
+## Session 68 - after the root-cause fix, a new and earlier fault: `router_select_plan` at a 2k prompt
+
+With `ap.f4`/`aa.f4` set, the decode now runs the F4 arms for the first time. The 25-token request still answers `391`,
+then a 10,657-token prompt ends the engine. With `CUDA_LAUNCH_BLOCKING=1` the sticky error surfaces at
+**`inkling2 router_select_plan`** (and `sample_tokens` without it) - both *early* launches with nothing to do with the KV
+layout, which is the signature of a fault inside a **replayed CUDA graph** (blocking mode does not serialise graph
+replays, as the review spec notes in 6.1). So the remaining defect is in the decode path under graph replay, and NVFP4 is
+the first format to run it through `attn_split_kernel` at depth (fp8/fp16 always take `attn_mma_kernel`; int8 from
+`kMmaMinKeys` up) - the spec's S1, with S4 (a fresh capture in a new power-of-two key bucket) beside it.
+
+Order for the next session: (1) the 6.2 bisect rows at 8k/12k/16k/24k to get the exact depth threshold and whether it is
+a power of two (S4) or byte-shaped (S1); (2) the 6.1 nsys trace with `--cuda-graph-trace=node`, whose last kernel rows
+name the site inside the replay; (3) then S1's own test - `attention_decode_int8_test(..., mma=false, ...)` at 30k/64k, so
+a split-path fault can be separated from a codec fault. Do not spend time on the fused F4 arm: `attention_window` takes the
+fused path only for int8, so `attn_fused_kernel<...,true>` is dead code in production (the review session's note 2).
