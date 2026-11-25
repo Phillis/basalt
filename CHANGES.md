@@ -207,3 +207,49 @@ Cancel mid-generation five times with the other slot decoding: decoder intact, n
 The KLD/PPL baseline against `inkling2-bf16-base.kld` was not taken: it needs a 100-chunk run and the reference file,
 and nothing in this phase changed arithmetic (Item 2 changes only the draft policy's window choice, which the target
 verifies).
+## D1 and D2 of SPEC-2SLOT-BUDGET-PHASE (measured, ae9213fd)
+
+**D1, the CPU path's knobs - neither moved it, so the item closes on its stop rule.**
+
+`--pool-workers` (two processes each, prose harness, per stream):
+
+| arm | ~2k | ~64k |
+|---|---|---|
+| auto (7, base) | 36.1 / 37.5 | 47.4 / 52.4 |
+| 11 | 37.2 | 46.8 |
+| 14 | 41.4 / 37.7 | 45.9 / 47.6 |
+
+14 wins the 2k arm by 7.6% (median) and loses 64k by 6.2% - inside the +/-10% this harness shows, so the default
+stays auto.
+
+`kTasksPerThread` (12 base -> 6, 4, 2; bit-identical by construction), settled by an interleaved A/B with two
+prebuilt executables, four rounds, two measurements each:
+
+| round | A (12) cold / warm | B (4) cold / warm |
+|---|---|---|
+| 1 | 36.3 / 46.9 | 37.8 / 46.1 |
+| 2 | 36.6 / 46.2 | 38.4 / 45.4 |
+| 3 | 36.3 / 46.2 | 36.8 / 43.4 |
+| 4 | 35.6 / 44.1 | 37.5 / 47.7 |
+| median | **36.3 / 46.2** | **37.65 / 45.75** |
+
+4 is +3.7% on the cold measurement (4 of 4 rounds the same way) and -1% warm: at the bottom of the 3-5% band and
+only on one of the two measurements, so **12 stays**. `kTasksPerThread = 2` measured 34.4 / 47.0 (one process), worse.
+
+With the knobs flat, D1's per-visit breakdown from Item 1's profile stands as its numbers: the merge
+(`moe_cpu_merge_kernel`) is 442 us average and **154 us median** per visit, i.e. that is what a visit actually waits
+for the pool, against 246 us of card-expert work it could hide behind - the wait is longer than the work, and neither
+task granularity nor worker count changes it. That is the datum D3 needs: the CPU term is latency per visit, not
+bandwidth, so moving experts to the GPU over the link shortens the round directly.
+
+**D2, the 71% slot - the premise does not reproduce.** Three processes, two measurements each, hit per slot:
+95.8 / 73.2, 88.8 / 93.5, 86.2 / 90.1. One process of three shows a low slot; the other two have both slots above
+86%. Across the whole session the low slot has appeared in *either* position (71.1 / 91.1, 74.5 / 69.8, 77.1 / 71.1,
+69.8 / 74.5, and now the above), so it is not a slot bias: it is content and which experts the heat-ranked copy set
+happens to hold for that conversation. Per the spec's own stop rule the item records its numbers and stops.
+
+**The `kElasticKeep` paradox, explained without a change.** `kElasticKeep` enters only `ensure_positions()`, and at a
+2k context `positions <= backed_` returns before it is read, so 256 MiB cannot have caused the 2k gain - that arm was
+noise in a harness that swings +/-10% (the same config measured 33.2 to 37.5 across processes tonight). At 64k the grow
+does run, and a smaller keep-free means the grow demotes more copies: fewer copies at depth is exactly the 44 -> 30
+measured. No change: the item is closed with the explanation.
