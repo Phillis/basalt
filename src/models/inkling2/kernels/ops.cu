@@ -3,6 +3,7 @@
 #include "basalt/kernels/doorbell.cuh"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/kernels/kv4.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -299,9 +300,14 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
         float scale[2] = {};
         const int64_t cell = p % a.cap;
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+        const size_t row_bytes = (size_t) kv_cache_row_bytes(a.fp8, a.int8, a.f4);
         void* cache = which ? a.v_cache : a.k_cache;
-        if (a.int8) {
+        if (a.f4) {   // [F4] NVFP4 rows: the keys turned, the values not
+            float vv[4] = {val0 * f, val1 * f, val2 * f, val3 * f};
+            void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;
+            if (which) store_v4nv(row, lane, vv);
+            else store_k4(row, lane, vv);
+        } else if (a.int8) {
             float val[4] = {val0, val1, val2, val3};
             int8_scales(val, f, lane, scale);
             void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;

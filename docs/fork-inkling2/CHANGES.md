@@ -4186,3 +4186,15 @@ Item 1 replaces the staged V4 plumbing with NVFP4: both planes 80 bytes a row, o
 
 No gate yet: this item is plumbing and the build is green. **`nvfp4` must not be run before Item 3** - the writers and
 loaders still speak fp16/fp8/int8, and the format is now selectable.
+
+## Session 67 - NVFP4 K/V, Item 2: the writers, and the query rotation
+
+- `prep.cuh`: includes `kernels/kv4.cuh`; `q_heads` turns the head's query with `kv4_hadamard128` after the clip factor
+  and before the store (one site, both the decode and the prompt path, since both read `AttnPrep.q`).
+- `glue.cu` (`attn_prepare`, the prompt path's writer) and `ops.cu` (its own copy): `row_bytes` from
+  `kv_cache_row_bytes(a.fp8, a.int8, a.f4)`, and an `a.f4` branch that stores the lane's four values with `store_k4`
+  (keys: turned) or `store_v4nv` (values: not turned). The int8/fp8/fp16 arms are untouched.
+- `kernels.hpp`: `kv_cache_row_bytes`/`kv_pair_bytes` are `__host__ __device__` under nvcc (the kernels form row
+  addresses), plain constexpr in host-only translation units.
+
+Build green. No gate yet: the readers (Item 3) are still fp16/fp8/int8, so nothing may be run with `--kv nvfp4`.

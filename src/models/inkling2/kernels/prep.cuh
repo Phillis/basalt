@@ -4,6 +4,7 @@
 #pragma once
 
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/kernels/kv4.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -174,6 +175,7 @@ __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t 
     }
 }
 
+
 // Warps 2 and 3 of head g for row r at position p: the clipped (and scaled) queries of heads 3g..3g+2 into q3
 // [3][kHeadDim], warp 3 also their relative states into r3 [3][kRel] and their sinks into s3 [3]. Every projection value a
 // warp takes is loaded before its first sum, so the warp waits for one memory trip, not one a head.
@@ -206,7 +208,9 @@ __device__ __forceinline__ void q_heads(const AttnPrep& a, int r, int p, int g, 
         }
         ss = warp_sum(ss);
         const float f = fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) * tau;
-        *reinterpret_cast<float4*>(q3 + (h - g * 3) * kHeadDim + lane * 4) = make_float4(q[0] * f, q[1] * f, q[2] * f, q[3] * f);
+        float qf[4] = {q[0] * f, q[1] * f, q[2] * f, q[3] * f};
+        if (a.f4) kv4_hadamard128(qf, lane);   // [F4] the queries are turned with the keys, once, here
+        *reinterpret_cast<float4*>(q3 + (h - g * 3) * kHeadDim + lane * 4) = make_float4(qf[0], qf[1], qf[2], qf[3]);
     }
     if (w == 3) {
 #pragma unroll

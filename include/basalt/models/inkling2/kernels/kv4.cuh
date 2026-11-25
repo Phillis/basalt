@@ -21,7 +21,6 @@
 
 namespace basalt::models::inkling2 {
 
-constexpr int kKvF4RowBytes = 80;                    ///< a key row and a value row alike
 constexpr int kKvF4CodeBytes = 64;                   ///< 128 four-bit codes
 constexpr int kKvF4Group = 16;                       ///< values one E4M3 scale byte covers
 constexpr int kKvF4Groups = 8;                       ///< scale bytes a row

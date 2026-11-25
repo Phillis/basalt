@@ -23,11 +23,19 @@ constexpr int kKvInt8RowBytes = (kHeadDim + 4 + 15) & ~15;   ///< INT8 values an
 // the keys (and every query read against them) turned by the normalized 128-point Hadamard transform.  See
 // kernels/kv4.cuh for the layout and the codec, and basalt/kernels/kv_fp4.cuh for the rounding the dense stack shares.
 constexpr int kKvF4RowBytes = 80;   ///< a key row and a value row: 64 code bytes, 8 scale bytes, 8 of padding
-constexpr int kv_cache_row_bytes(bool fp8, bool int8, bool f4) {
+// Device code writes and reads these rows too, so the size helpers are __host__ __device__ where nvcc is compiling and
+// plain constexpr in a host-only translation unit.
+#if defined(__CUDACC__)
+#define BASALT_HD_ __host__ __device__
+#else
+#define BASALT_HD_
+#endif
+BASALT_HD_ constexpr int kv_cache_row_bytes(bool fp8, bool int8, bool f4) {
     return f4 ? kKvF4RowBytes : fp8 ? kHeadDim : int8 ? kKvInt8RowBytes : 2 * kHeadDim;
 }
 /// What one position costs across K and V (with NVFP4 the two rows are the same size, so the cells are equal).
-constexpr int kv_pair_bytes(bool fp8, bool int8, bool f4) { return 2 * kv_cache_row_bytes(fp8, int8, f4); }
+BASALT_HD_ constexpr int kv_pair_bytes(bool fp8, bool int8, bool f4) { return 2 * kv_cache_row_bytes(fp8, int8, f4); }
+#undef BASALT_HD_
 constexpr int kRel = 16;            ///< relative state per head
 constexpr int kExtent = 1024;       ///< distances the relative bias covers (also the window)
 constexpr int kConv = 4;            ///< short convolution taps
