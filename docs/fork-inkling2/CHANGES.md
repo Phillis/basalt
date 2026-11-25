@@ -4393,3 +4393,36 @@ a power of two (S4) or byte-shaped (S1); (2) the 6.1 nsys trace with `--cuda-gra
 name the site inside the replay; (3) then S1's own test - `attention_decode_int8_test(..., mma=false, ...)` at 30k/64k, so
 a split-path fault can be separated from a codec fault. Do not spend time on the fused F4 arm: `attention_window` takes the
 fused path only for int8, so `attn_fused_kernel<...,true>` is dead code in production (the review session's note 2).
+
+## Session 68 - NVFP4 handover: two root causes found and fixed, one fault left (decode under graph replay)
+
+Fixed and verified this session:
+
+1. **The codec was broken**: `kv4_hadamard128`'s in-lane butterfly read `v[j ^ h]` after overwriting it (rank 64). The
+   parity test written first proved it (4/4 checks failing by O(1)), and after the six-line fix passes 4/4 (Walsh matrix
+   3.0e-07). Found by the review session, not by me.
+2. **The decode window never set `.f4`** (`session.cpp`): every decode ran the fp16 arms - `row_bytes` 256 written into an
+   80-byte cache, and `use_mma` true so `attn_mma_kernel` read those rows as fp16. That is the depth-dependent access
+   violation, the garbage at 10.6k, and the same bug that killed the fp8v4 port on this base. Found by the review session.
+   Fixed (`ap.f4`/`aa.f4`), and the parity harnesses' `kv_set` now states `f4 = false` so they cannot silently test fp16.
+
+Ruled out along the way, each by a measurement rather than an argument: card occupancy (reserve 256/768 identical), the
+elastic grow, batch segments (`parallel 1`, `prompt-cache 0`, single in-flight request still faulted), the attention
+scratch sizing (`attention_decode_scratch` is sized from `max(ctx, window)`, so the split path's `z` is covered), and the
+fused F4 arm (dead code: `attention_window` takes the fused path only for int8).
+
+**What is left.** With the flags fixed, 25 tokens answers `391` correctly and the F4 decode path runs; a 10,657-token
+prompt still ends the engine, and with `CUDA_LAUNCH_BLOCKING=1` the sticky error surfaces at `inkling2
+router_select_plan` (at `sample_tokens` without it) - early launches with no KV involvement, i.e. a fault inside a
+**replayed CUDA graph**, which blocking mode cannot serialise. NVFP4 is the first format to reach `attn_split_kernel` at
+depth in production (fp8/fp16 always take `attn_mma_kernel`, int8 from `kMmaMinKeys` up), so the spec's S1 sits beside
+S4 (a fresh capture in a new power-of-two key bucket).
+
+Next session, in this order, all one run each:
+1. `nsys profile --trace=cuda --cuda-graph-trace=node ... bin\basalt.exe ...` on a 10k prompt, then
+   `nsys stats --report cuda_gpu_trace` - the last kernel rows inside the replay name the site.
+2. The 6.2 bisect at 8k/12k/16k/24k: a power-of-two threshold points at S4, a byte-shaped one at S1.
+3. S1's own test: `attention_decode_int8_test(..., mma=false, ...)` at 30k/64k - if int8 also faults on the split path,
+   the codec is innocent and the split-at-depth plumbing is the bug.
+
+Machine left clean: live engine on `pr650-int` (verified `391`), `nvfp4-kv` at 12 commits past `bf330c03`, nothing pushed.
