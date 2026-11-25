@@ -4581,3 +4581,10 @@ remembering):
 Median gain ~+2-6% decode (64k: 52 -> 55), inside-to-edge-of the noise band, and it restores the loan cycling the batch
 path skipped - kept for that reason as much as for the speed. Prefill is unchanged (1,619 / 1,543 with the pump against
 1,614 / 1,539 without).
+
+## Session 68 - one session at 256k on the merged base: fp8 fits and recalls at 172k
+
+Plan `cuda0=2.3 GiB ram=12.9 GiB` with `kv fp8`, one slot, 262,144 context; profile `basalt_config-1x256k-fp8-merged.json`.
+A 172,001-token prompt with the passphrase at note 2: **ZEBRA-42 recalled**, ~1,660 t/s prefill (103.6 s end to end),
+~58 t/s decode (9 tokens in 154 ms, 6 of 6 drafts accepted), hit 68%. `kv nvfp4` also fits at 256k but its KLD is 2.3x
+fp8's, so fp8 is the format for this workload too.

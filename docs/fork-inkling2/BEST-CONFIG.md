@@ -66,3 +66,18 @@ The pump is kept (it also restores the expert-loan cycling the batch path skippe
 Methodology note that matters for every number in this file: **the first `curve2.py` run after an engine start is 10-30%
 slower than the steady state** (30k decode 38.2 against 55-57). Every figure quoted as a comparison here is from the second
 run onward.
+
+## One session at 256k (the second workload)
+
+The merged base fits a full 256k context with **fp8** on one slot: plan `cuda0=2.3 GiB ram=12.9 GiB`, profile
+`basalt_config-1x256k-fp8-merged.json`. Measured with a 172,001-token prompt (the passphrase buried at note 2):
+
+| | result |
+|---|---|
+| correctness | **ZEBRA-42 recalled** from position ~120 of 172,001 |
+| prefill | **~1,660 t/s** (172,001 tokens in 103.6 s end to end) |
+| decode | **~58 t/s** (9 tokens in 154 ms on a warm window, 6 of 6 drafts accepted) |
+| hit rate | 68% |
+
+`kv nvfp4` also fits at 256k (plan `cuda0=3.9 / ram=11.3`) but is not used: its KLD is 2.3x fp8's. `kv fp8v4` does not
+exist on this base (nvfp4 replaced it there).
