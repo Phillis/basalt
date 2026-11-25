@@ -185,3 +185,25 @@ served. Off by default meanwhile: it writes 1.24 GB per parked conversation for 
 Item 7.2 (a second slot reusing the first slot's system-prompt cells, `slots_share_cells()` is false and
 `copy_from_slot`/`copy_to_slot` are stubs in inkling2) was not attempted - it is the same cell-copy machinery this
 item shows is not reachable at two slots yet.
+## Items 4, 8 and 9: closed or carried
+
+**Item 4, expert GEMV bandwidth - closed without kernel work.** Item 1's totals give `native_gu_multi_kernel`
+1,705 calls in 258 ms (152 us each) and `native_down_sub8_kernel` 1,705 in 160 ms (94 us each). One call reads the
+gate/up blobs of the experts its visit's rows use: about 6 rows x 8 experts x ~75% distinct x 5.2 MiB is ~187 MiB a
+call, i.e. **~1,291 GB/s** by that estimate (and ~1,044 GB/s for the down product's half width) against a 5070 Ti
+laptop's roughly 900 GB/s of GDDR7 - the estimate overshoots the card, which means the blob/row assumptions are
+generous, but either way the kernels are **at or near the card's bandwidth**, so the spec's 60% gate is not met and
+Item 4 is closed. (An `ncu` capture would settle the exact figure; it changes no decision.)
+
+**Item 8, interleaving - deliberately not built.** The spec describes it as a responsiveness trade, not a throughput
+gain ("the reader pays for every round"), default off. Under the standing rule for this phase - keep only what
+improves decode or prefill - a flag that defaults off improves neither, so it is carried to the next phase rather than
+built now. Its design (a yield hook on `PrefillRequest`, the staging lock released around a yield, a per-session decode
+tap) is written in the spec and needs the tap split first, which is its own small change.
+
+**Item 9, gates - the two that were missing ran green; the numerics baseline was not run.** Three needles at
+10/50/90% of depth, read into one slot while the other decodes: **3/3 exact at 64,049 tokens and 3/3 at 119,985**.
+Cancel mid-generation five times with the other slot decoding: decoder intact, next request fine, **0 crashes**.
+The KLD/PPL baseline against `inkling2-bf16-base.kld` was not taken: it needs a 100-chunk run and the reference file,
+and nothing in this phase changed arithmetic (Item 2 changes only the draft policy's window choice, which the target
+verifies).
