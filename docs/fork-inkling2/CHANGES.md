@@ -4104,3 +4104,26 @@ Recorded a false pass: `kv=fp8v4` with staged sizes and upstream's unported kern
 writing 128-byte value rows into 80-byte cells - hence the v4 port is gated on parity and needles, not Gate 0.
 Live engine re-verified after the switch back: `cuda0 2.0 / ram 13.2`, Gate 0 correct, prose 41.5 / 47.0 per stream
 at hit 83-96%, prefill 1,231 per stream.
+
+## Session 66 - stage 2: the four-bit codec ported into upstream's rewritten attention (one fault remains)
+
+Ported the v4 value cache into `attn.cu` (split + fused kernels, `V4` template, loader, unpack, store, MMA gate,
+3 + 6 instantiations), `attn_prompt.cu` (codec, `RawKvTile.kRowV`, per-plane piece counts, unpack, kernel, dispatch),
+`prep.cuh` and `ops.cu` (their codec copies), `glue.cu` (prepare store + the read-ahead's per-plane cell) and
+`kernels.hpp` (`MixNorm.kv_cell_v`). Branch `merge-upstream`, commit `032ab699`, pushed as
+`merge-upstream-31174039`.
+
+Three defects caught, all of them silent-corruption class: a mangled address in the prompt loader's slow path; a
+**dispatch that was never templated** (so `fp8v4` launched the fp8 prompt kernel and read 80-byte value rows at the
+key's stride); and upstream's new KV read-ahead prefetching past the end of the value array because it strode both
+planes by the key cell. `use_mma` now excludes v4 (the MMA kernels read 16-byte K/V rows).
+
+Still failing with `kv=fp8v4`, so **not shipped**: long prompts die with a sticky "illegal memory access" surfacing
+at the next expert copy. Two slots: at the 32768 -> 65536 elastic grow. One slot: even earlier, in the first chunk's
+prefill (positions 27/229). Short prompts and Gate 0 are fine; the same build at `kv=fp8` passes needles 3/3 at 64k,
+so the fault is v4-specific. `compute-sanitizer` cannot attach on this box (the engine re-execs, WDDM).
+Next: name the kernel (console + `--target-processes all`, or a `BASALT_DIAG_KV` bounds assertion), bisect the
+read-ahead (`mn.kv_pos = nullptr`), the first-chunk path (`parallel 1`, 5k prompt), and the park/restore path.
+
+Live engine back on `pr650-int` (`3dd59a13`), rebuilt and verified: cuda0 2.0 / ram 13.2 GiB, Gate 0 correct,
+needles 3/3 at 64,002, prose 41.5 / 47.0 per stream at hit 83-96%.

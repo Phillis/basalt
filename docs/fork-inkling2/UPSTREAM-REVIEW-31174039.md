@@ -235,3 +235,61 @@ our tree: 1,705 / 1,500, 46.2 / 44.9, hit 83-96%).
 
 Do not run `kv=fp8v4` with the staged sizes and an unported attention to "see if it works". It answers Gate 0
 correctly while writing 128-byte value rows into 80-byte cells (see the false pass above). Verify with needles.
+
+## Stage 2 EXECUTED (branch `merge-upstream`, 032ab699): the codec is in place, one fault keeps it off the live engine
+
+The four-bit value cache is now ported into upstream's rewritten kernels - re-applied, not cherry-picked, because
+upstream rewrote `attn.cu` (+957) and `attn_prompt.cu` (+480). Five writers and three readers now agree on an
+80-byte value row:
+
+    attn.cu         the codec (v4_e2m1_code/mag/value, unpack32_v4, unpack16_v4, v4_row_scales, v4_scales, store_v4);
+                    a V4 parameter on attn_split_kernel<FP8,INT8,SkipDeep,V4> and attn_fused_kernel<FP8,INT8,ROWS,V4>;
+                    kVRowBytes/kNScales; the tile loader's four-16-byte-load branch; the value unpack; the store;
+                    use_mma = !int8 && !v4 (the MMA kernels read 16-byte K/V rows); 3 + 6 v4 instantiations
+    attn_prompt.cu  the codec; RawKvTile.kRowV; a loader with a piece count per plane; the four-bit unpack; the
+                    kernel template; and the dispatch (which is where the second bug was)
+    prep.cuh        the codec the store paths share
+    glue.cu         the prepare kernel's value store; and the KV read-ahead's per-plane cell (the third bug)
+    ops.cu          its own copy of the codec and its value store
+    kernels.hpp     MixNorm.kv_cell_v
+
+### The three defects it caught (all silent-corruption class, all found by reading or by a fault, not by Gate 0)
+
+1. **`attn_prompt.cu`'s slow path**: I wrote `base + slot * kKvHeads + rb` where the address is
+   `base + (slot * kKvHeads + kvh) * rb + col`. Symptom: "misaligned address" on the first long prompt.
+2. **`attention_prompt`'s dispatch was never templated**: the kernel took a V4 parameter but the dispatch still launched
+   `attn_prompt_kernel<true,false>` for `fp8v4`, so the prompt read value rows at the key's stride. Symptom: illegal
+   memory access during the first chunk.
+3. **The KV read-ahead** (`mix_norm_kernel`'s prefetcher, upstream's new L2 warm-up) strode *both* planes by `kv_cell`,
+   so with 80-byte value rows it prefetched past the end of the value array. It now takes `kv_cell_v`.
+
+### What still fails, precisely
+
+With `kv=fp8v4` on this build, long prompts die with "staging a layer's RAM experts failed: an illegal memory access"
+- a sticky error surfacing at the next copy, not the faulting kernel:
+
+    two slots, 2 x 128k:  dies at the 32768 -> 65536 elastic grow ("cache grow to 65536 positions at 32768")
+    one slot:             dies earlier, during the first chunk's prefill (positions 27 and 229 in the log)
+    short prompts (28-79 tokens): fine.  Gate 0: answers correctly throughout - which is why it is not evidence.
+    control on the same build, kv=fp8: needles 3/3 at 64,016.  So the fault is in the v4 path only.
+
+Repro: `bin\basalt.exe serve --config basalt_config.json ...` with `kv: fp8v4`, then
+`python C:\LLM\Basalt\needles3.py 40000 200` (one slot fails even earlier).
+
+### Next steps, in order
+
+1. **Name the kernel.** `compute-sanitizer --tool memcheck` could not attach here ("No attachable process found",
+   the engine re-execs and WDDM hides the child). Run the engine in a *console* with `--target-processes all` and
+   `--launch-timeout 1800`, or add a bounds assertion behind `BASALT_DIAG_KV` in the v4 readers (compare
+   `cell * kKvHeads * kVRowBytes` against the array's `backed()`).
+2. **Bisect the remaining suspects cheaply**, each one a rebuild: (a) set `mn.kv_pos = nullptr` to remove the
+   read-ahead entirely; (b) `kv=fp8v4` with `parallel 1` and a 5k prompt (does the *first* chunk alone fail?);
+   (c) check the batch path (`save_cells`/`restore_cells`) by parking a long conversation between two requests.
+3. Then the full gate: Gate 0, parities (with v4 cases added), needles 3/3 at 64k and 120k, 262,144-token load,
+   an 83k prompt, stress 20 - and only then the numbers (bar: merged fp8 1,753 / 1,606 prefill, 40.6 / 51.6 decode;
+   our tree 1,705 / 1,500, 46.2 / 44.9).
+
+### Where the live engine is
+
+`pr650-int` (`3dd59a13`), rebuilt and verified after this work: plan cuda0 2.0 / ram 13.2 GiB, Gate 0 correct,
+needles 3/3 at 64,002, prose 41.5 / 47.0 tok/s per stream at hit 83-96%, prefill 1,231 t/s per stream.
