@@ -4541,3 +4541,22 @@ So the trade is the same one our tree found: a bigger chunk amortises the stagin
 buffers take the card room the expert copies want (decode down). 8,192 is out of reach for fp8 at two 128k slots
 (its staging is twice nvfp4's, which is why the four-bit formats could use it). 4,096 stays the default - decode-first,
 which is what a chat/agent stream spends its time in - and 5,120 is the flag's recommendation for prefill-heavy use.
+
+## Session 68 - the 2 x 128k numbers, and the configuration that beats the live one
+
+Full curves in `BEST-CONFIG.md`. Per stream, both slots decoding, merged base:
+
+| build | kv | chunk | KLD / top-1 | prefill 30k/64k/96k/120k | decode 30k/64k/96k/120k |
+|---|---|---|---|---|---|
+| merged | fp8 | 4096 | 0.00586 / 96.80% | 1,770 / 1,623 / 1,398 / 1,284 | 41.0 / 53.1 / 57.6 / 51.6 |
+| merged | fp8 | 5120 | 0.00586 / 96.80% | 2,006 / 1,781 / 1,563 / 1,435 | 37.7 / 51.3 / 49.6 / 48.5 |
+| merged | nvfp4 | 4096 | 0.01374 / 95.04% | 1,890 / 1,756 / - / - | 40.1 / 46.5 / 50.0 / - |
+| ours (live) | fp8v4 | 5120 | 0.01193 / 95.33% | 1,705 / 1,500 / 1,315 / 1,190 | 46.2 / 44.9 / 43.3 / 43.3 |
+
+The merged base with `kv fp8` is **+18% / +33% / +19% decode** at 64k / 96k / 120k and **+6-8% prefill** against the
+configuration live now, with **better quality**. It loses only at 30k (41.0 against 46.2). `--prompt-chunk 5120` trades
+-3 to -8% decode for +10-13% prefill at every depth, which is the better side of that trade for prefill-heavy agent turns.
+
+Also measured and kept at their defaults: `--spec` 0/2/4/8 are inside the noise band (35.8-40.8 at 30k, 48.5-50.7 at 64k);
+`--vram-reserve-mib` 256 is the floor the plan accepts. Profile saved as `basalt_config-2x128k-fp8-merged.json`.
+Needles pass 3/3 at 120,000 on the recommended configuration.
