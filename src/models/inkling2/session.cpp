@@ -1235,6 +1235,7 @@ private:
         mn.kv_cap = c.cap;
         mn.kv_window = c.ring ? g_.window : 0;
         mn.kv_cell = (int) cell_bytes();
+        mn.kv_cell_v = (int) v_cell_bytes();   // [V4]
         mn.ring_k = c.k_ring;
         mn.ring_v = c.v_ring;
         mn.ring_a = c.a_ring;

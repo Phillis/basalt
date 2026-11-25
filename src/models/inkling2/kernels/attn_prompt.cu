@@ -41,24 +41,25 @@ struct KvTile {
     __half v[kKeys][kLd];
 };
 
-template <bool FP8>
+template <bool FP8, bool V4 = false>
 struct RawKvTile {
     static constexpr int kRowB = FP8 ? kHeadDim : kKvInt8RowBytes;
+    static constexpr int kRowV = V4 ? kKvV4RowBytes : kRowB;   // [V4] the value row may be shorter than the key's
     alignas(16) uint8_t k[kKeys][kRowB];
-    alignas(16) uint8_t v[kKeys][kRowB];
+    alignas(16) uint8_t v[kKeys][kRowV];
 };
 
 // Keep K/V ping-pong tiles separate from the relative-bias exchange so every tile (including sliding-window and near
 // tiles within kExtent) overlaps its cp.async transfer with tensor-core compute.
 constexpr int kFarStages = 4;
-template <bool FP8, bool INT8>
+template <bool FP8, bool INT8, bool V4 = false>
 union Smem {
     struct {
-        RawKvTile<FP8> raw[kFarStages];
+        RawKvTile<FP8, V4> raw[kFarStages];
         KvTile kt[2];
     } far_q;
     struct {
-        RawKvTile<FP8> raw[2];
+        RawKvTile<FP8, V4> raw[2];
         KvTile kt;
         __half band[kBand][kBandLd];
         float gx[kWarps][16][kGLd];
@@ -66,7 +67,7 @@ union Smem {
 };
 
 template <>
-union Smem<false, false> {
+union Smem<false, false, false> {
     KvTile tf[kFarStages];
     struct {
         KvTile t0;
@@ -107,6 +108,33 @@ __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t u) {
     const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) u, __NV_E4M3);
     return (uint32_t) h.x | ((uint32_t) h.y << 16);
 }
+
+// [V4] The code set: E2M1 - 0, .5, 1, 1.5, 2, 3, 4, 6 and their negatives (the NVFP4 one). A linear four-bit code spends
+// a heavy row's step on its largest value; these do not.
+__device__ __forceinline__ float v4_e2m1_mag(int i) {
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+__device__ __forceinline__ int v4_e2m1_code(float x) {   // nearest code; bit 3 is the sign
+    const float a = fabsf(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}__device__ __forceinline__ float v4_e2m1_value(int code) {
+    const float m = v4_e2m1_mag(code & 7);
+    return (code & 8) ? -m : m;
+}
+// [V4] 16 values of a four-bit row from its eight code bytes and their scale, rounded to fp16 pairs.
+__device__ __forceinline__ void v4x16_to_h8(const uint2 u, float scale, uint32_t (&h)[8]) {
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            const __half2 hv = __floats2half2_rn(v4_e2m1_value(lo) * scale, v4_e2m1_value(hi) * scale);
+            h[4 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);   // four half2 a word
+        }
+}
+// One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
 
 __device__ __forceinline__ int64_t wrap_key(int64_t key, int64_t cap, bool pow2) {
     if (key < cap) return key;
@@ -167,59 +195,63 @@ __device__ __forceinline__ void load_tile_f16(const AttnPromptArgs& a, KvTile& s
     }
 }
 
-template <bool FP8>
-__device__ __forceinline__ void load_raw_tile(const AttnPromptArgs& a, RawKvTile<FP8>& rt, int kvh, int64_t k0, int64_t lo,
+template <bool FP8, bool V4 = false>
+__device__ __forceinline__ void load_raw_tile(const AttnPromptArgs& a, RawKvTile<FP8, V4>& rt, int kvh, int64_t k0, int64_t lo,
                                               int64_t hi, int tid, bool cap_pow2, bool chunk_pow2) {
-    constexpr int kRowB = RawKvTile<FP8>::kRowB;
-    constexpr int kVecs = kRowB / 16;
-    constexpr int kPieces = kKeys * kVecs;
+    constexpr int kRowB = RawKvTile<FP8, V4>::kRowB;
+    constexpr int kRowV = RawKvTile<FP8, V4>::kRowV;
+    constexpr int kVecs = kRowB / 16, kVecsV = kRowV / 16;   // [V4] each plane its own piece count
+    constexpr int kPieces = kKeys * kVecs, kPiecesV = kKeys * kVecsV;
     if (k0 >= lo && k0 + kKeys - 1 <= hi && (k0 + kKeys <= a.pos0 || k0 >= a.pos0)) {
         const bool fresh = k0 >= a.pos0;
         const int64_t cap = fresh ? a.chunk_cap : a.cap;
         const uint32_t cap32 = (uint32_t) cap;
         const uint32_t s0 = tile_slot0(k0, cap, fresh ? chunk_pow2 : cap_pow2);
         const uint8_t* kc = static_cast<const uint8_t*>(fresh ? a.k_chunk : a.k_cache) + (size_t) kvh * kRowB;
-        const uint8_t* vc = static_cast<const uint8_t*>(fresh ? a.v_chunk : a.v_cache) + (size_t) kvh * kRowB;
+        const uint8_t* vc = static_cast<const uint8_t*>(fresh ? a.v_chunk : a.v_cache) + (size_t) kvh * kRowV;
         if (s0 + kKeys <= cap32) {
 #pragma unroll
-            for (int c = tid; c < 2 * kPieces; c += kThreads) {
+            for (int c = tid; c < kPieces + kPiecesV; c += kThreads) {
                 const bool isv = c >= kPieces;
                 const int rem = isv ? c - kPieces : c;
-                const int j = rem / kVecs, col = (rem - j * kVecs) * 16;
-                const size_t off = (size_t) (s0 + (uint32_t) j) * (kKvHeads * kRowB) + col;
+                const int vecs = isv ? kVecsV : kVecs, rb = isv ? kRowV : kRowB;
+                const int j = rem / vecs, col = (rem - j * vecs) * 16;
+                const size_t off = (size_t) (s0 + (uint32_t) j) * (kKvHeads * rb) + col;
                 cp16(isv ? &rt.v[j][col] : &rt.k[j][col], (isv ? vc : kc) + off, true);
             }
         } else {
 #pragma unroll
-            for (int c = tid; c < 2 * kPieces; c += kThreads) {
+            for (int c = tid; c < kPieces + kPiecesV; c += kThreads) {
                 const bool isv = c >= kPieces;
                 const int rem = isv ? c - kPieces : c;
-                const int j = rem / kVecs, col = (rem - j * kVecs) * 16;
+                const int vecs = isv ? kVecsV : kVecs, rb = isv ? kRowV : kRowB;
+                const int j = rem / vecs, col = (rem - j * vecs) * 16;
                 uint32_t sl = s0 + (uint32_t) j;
                 if (sl >= cap32) sl -= cap32;
-                const size_t off = (size_t) sl * (kKvHeads * kRowB) + col;
+                const size_t off = (size_t) sl * (kKvHeads * rb) + col;
                 cp16(isv ? &rt.v[j][col] : &rt.k[j][col], (isv ? vc : kc) + off, true);
             }
         }
         return;
     }
-    for (int c = tid; c < 2 * kPieces; c += kThreads) {
+    for (int c = tid; c < kPieces + kPiecesV; c += kThreads) {
         const bool isv = c >= kPieces;
         const int rem = isv ? c - kPieces : c;
-        const int j = rem / kVecs, col = (rem - j * kVecs) * 16;
+        const int vecs = isv ? kVecsV : kVecs, rb = isv ? kRowV : kRowB;
+        const int j = rem / vecs, col = (rem - j * vecs) * 16;
         const int64_t key = k0 + j;
         const bool ok = key >= lo && key <= hi;
         const bool fresh = key >= a.pos0;
         const int64_t cap = fresh ? a.chunk_cap : a.cap;
         const int64_t slot = ok ? wrap_key(key, cap, fresh ? chunk_pow2 : cap_pow2) : 0;
         const uint8_t* base = static_cast<const uint8_t*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
-        const uint8_t* src = base + ((size_t) slot * kKvHeads + kvh) * kRowB + col;
+        const uint8_t* src = base + ((size_t) slot * kKvHeads + kvh) * (size_t) rb + col;
         cp16(isv ? &rt.v[j][col] : &rt.k[j][col], src, ok);
     }
 }
 
-template <bool FP8>
-__device__ __forceinline__ void unpack_raw_tile(const RawKvTile<FP8>& rt, KvTile& sm, int tid) {
+template <bool FP8, bool V4 = false>
+__device__ __forceinline__ void unpack_raw_tile(const RawKvTile<FP8, V4>& rt, KvTile& sm, int tid) {
     constexpr int kPieces = kKeys * kHeadDim / 16;
 #pragma unroll
     for (int c = tid; c < 2 * kPieces; c += kThreads) {
@@ -229,7 +261,20 @@ __device__ __forceinline__ void unpack_raw_tile(const RawKvTile<FP8>& rt, KvTile
         const uint8_t* rptr = isv ? rt.v[j] : rt.k[j];
         const uint4 u = *reinterpret_cast<const uint4*>(rptr + col);
         uint32_t h[8];
-        if constexpr (FP8) {
+        if constexpr (V4) {   // [V4] a value row: 8 code bytes and their 32-value group's scale
+            if (isv) {
+                const uint2 u2 = *reinterpret_cast<const uint2*>(rptr + col / 2);
+                const float sc = __half2float(reinterpret_cast<const __half*>(rptr + kKvV4CodeBytes)[col / kKvV4Group]);
+                v4x16_to_h8(u2, sc, h);
+            } else {
+                const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    h[2 * i] = e4m3x2_to_h2((uint16_t) (w[i] & 0xFFFFu));
+                    h[2 * i + 1] = e4m3x2_to_h2((uint16_t) (w[i] >> 16));
+                }
+            }
+        } else if constexpr (FP8) {
             const uint32_t w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -255,7 +300,7 @@ __device__ __forceinline__ void unpack_raw_tile(const RawKvTile<FP8>& rt, KvTile
     }
 }
 
-template <bool FP8, bool INT8>
+template <bool FP8, bool INT8, bool V4 = false>
 __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnPromptArgs a, const int rows, float* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem<FP8, INT8>& sm = *reinterpret_cast<Smem<FP8, INT8>*>(smem_raw);
@@ -635,9 +680,16 @@ void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* strea
         cudaFuncSetAttribute(attn_prompt_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<true, false>));
         cudaFuncSetAttribute(attn_prompt_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<false, false>));
         cudaFuncSetAttribute(attn_prompt_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<false, true>));
+        cudaFuncSetAttribute(attn_prompt_kernel<true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<true, false, true>));
+        cudaFuncSetAttribute(attn_prompt_kernel<false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<false, false, true>));
+        cudaFuncSetAttribute(attn_prompt_kernel<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<false, true, true>));
         z = true;
     }
-    if (a.int8) attn_prompt_kernel<false, true><<<grid, kThreads, sizeof(Smem<false, true>), s>>>(a, rows, out);
+    if (a.v4) {   // [V4] the keys in their own format, the value rows four-bit
+        if (a.int8) attn_prompt_kernel<false, true, true><<<grid, kThreads, sizeof(Smem<false, true, true>), s>>>(a, rows, out);
+        else if (a.fp8) attn_prompt_kernel<true, false, true><<<grid, kThreads, sizeof(Smem<true, false, true>), s>>>(a, rows, out);
+        else attn_prompt_kernel<false, false, true><<<grid, kThreads, sizeof(Smem<false, false, true>), s>>>(a, rows, out);
+    } else if (a.int8) attn_prompt_kernel<false, true><<<grid, kThreads, sizeof(Smem<false, true>), s>>>(a, rows, out);
     else if (a.fp8) attn_prompt_kernel<true, false><<<grid, kThreads, sizeof(Smem<true, false>), s>>>(a, rows, out);
     else attn_prompt_kernel<false, false><<<grid, kThreads, sizeof(Smem<false, false>), s>>>(a, rows, out);
     check("attention_prompt");

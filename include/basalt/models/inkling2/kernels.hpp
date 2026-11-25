@@ -281,6 +281,7 @@ struct MixNorm {
     int64_t kv_cap = 0;
     int kv_window = 0;
     int kv_cell = 0;                   ///< bytes of a cell (every key/value head)
+    int kv_cell_v = 0;                 ///< [V4] bytes of a value cell (its rows may be shorter than the keys')
     /// set with kv_pos: the convolution rings' entries of the three positions before the window (the attention's key and
     /// value rings, [kConvRing][1024], and the attention output's, [kConvRing][kWidth]) into L2 the same way, whatever
     /// the context

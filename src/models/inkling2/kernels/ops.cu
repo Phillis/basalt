@@ -217,6 +217,42 @@ __device__ __forceinline__ float4 conv_in4(const float* __restrict__ y, int ld, 
     return *reinterpret_cast<const float4*>(ring + (size_t) (p % kConvRing) * ring_w + c);
 }
 
+// gaussian ones.
+__device__ __forceinline__ float v4_e2m1_mag(int i) {   // |code| for the code's 3 magnitude bits
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+__device__ __forceinline__ int v4_e2m1_code(float x) {   // nearest code, bit 3 the sign
+    const float a = fabsf(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}
+__device__ __forceinline__ float v4_e2m1_value(int code) {
+    const float m = v4_e2m1_mag(code & 7);
+    return (code & 8) ? -m : m;
+}
+// [V4] the four-bit value codec (prep.cuh carries the same one; this file keeps its own copies)
+__device__ __forceinline__ void v4_scales(const float (&v)[4], float f, int lane, float (&s)[kKvV4Groups]) {
+    constexpr int kLanesPerGroup = kKvV4Group / 4;
+    float a = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
+    for (int m = 1; m < kLanesPerGroup; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    s[lane / kLanesPerGroup] = __half2float(__float2half_rn(a / kV4CodeMaxMag));   // the fp16 value the row stores
+}
+__device__ __forceinline__ void store_v4(void* row, int lane, const float (&v)[4], const float (&s)[kKvV4Groups]) {
+    const int idx0 = lane * 4, group = idx0 / kKvV4Group;
+    const float sc = s[group];
+    uint8_t* codes = static_cast<uint8_t*>(row);
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const int lo = v4_e2m1_code(sc > 0.f ? v[2 * b] / sc : 0.f);
+        const int hi = v4_e2m1_code(sc > 0.f ? v[2 * b + 1] / sc : 0.f);
+        codes[(size_t) (idx0 / 2 + b)] = (uint8_t) ((lo & 0xF) | ((hi & 0xF) << 4));
+    }
+    if (idx0 % kKvV4Group == 0) reinterpret_cast<__half*>(codes + kKvV4CodeBytes)[group] = __float2half_rn(sc);
+}
+
+
 __device__ __forceinline__ void store_kv4(void* cache, bool fp8, size_t idx, float v0, float v1, float v2, float v3) {
     if (fp8) {
         __nv_fp8_e4m3 q0(v0), q1(v1), q2(v2), q3(v3);
@@ -299,9 +335,16 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
         float scale[2] = {};
         const int64_t cell = p % a.cap;
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+        const size_t k_row = (size_t) (a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim);
+        const size_t row_bytes = which && a.v4 ? (size_t) kKvV4RowBytes : k_row;   // [V4]
         void* cache = which ? a.v_cache : a.k_cache;
-        if (a.int8) {
+        if (a.v4 && which) {   // [V4] a value row
+            const float vv[4] = {val0 * f, val1 * f, val2 * f, val3 * f};
+            float s4[kKvV4Groups];
+            v4_scales(vv, 1.f, lane, s4);
+            void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;
+            store_v4(row, lane, vv, s4);
+        } else if (a.int8) {
             float val[4] = {val0, val1, val2, val3};
             int8_scales(val, f, lane, scale);
             void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;

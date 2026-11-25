@@ -120,6 +120,81 @@ __device__ __forceinline__ void unpack16_int8(const uint4 u, float scale, float 
 }
 // A code's exact half is its biased byte under 1024's exponent, less 1152. When scaled, the fp16 product has the same
 // bits as the exact fp32 product rounded to fp16.
+
+// [V4] The code set: E2M1 - 0, .5, 1, 1.5, 2, 3, 4, 6 and their negatives (the NVFP4 one). A linear four-bit code spends
+// a heavy row's step on its largest value; these do not.
+__device__ __forceinline__ int v4_e2m1_code(float x) {   // nearest code; bit 3 is the sign
+    const float a = fabsf(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}
+__device__ __forceinline__ float v4_e2m1_mag(int i) {
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+__device__ __forceinline__ float v4_e2m1_value(int code) {
+    const float m = v4_e2m1_mag(code & 7);
+    return (code & 8) ? -m : m;
+}
+
+
+// ---- [V4] four-bit value rows (prep.cuh carries the same codec; this file does not include it) ----------------------
+__device__ __forceinline__ void v4_row_scales(const uint8_t* row, float (&s)[kKvV4Groups]) {
+#pragma unroll
+    for (int g = 0; g < kKvV4Groups; ++g) s[g] = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[g]);
+}
+// [V4] 32 values of a row from one 16-byte load (32 four-bit codes, exactly one scale group) as fp16 pairs: the
+// four-bit codes are small integers, so the convert is an integer one and the scale a half2 multiply.
+__device__ __forceinline__ void unpack32_v4(const uint4 u, float scale, uint32_t (&h)[16]) {
+    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+    const __half2 s2 = __float2half2_rn(scale);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {   // four bytes a word, a byte two values
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            const __half2 hv = __hmul2(__halves2half2(__float2half_rn(v4_e2m1_value(lo)),
+                                                      __float2half_rn(v4_e2m1_value(hi))), s2);
+            h[4 * i + j] = *reinterpret_cast<const uint32_t*>(&hv);
+        }
+}
+// 16 values of a row from its eight code bytes and their scale, as fp32.
+__device__ __forceinline__ void unpack16_v4(const uint2 u, float scale, float (&f)[16]) {
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            f[8 * i + 2 * j] = (float) (lo >= 8 ? lo - 16 : lo) * scale;
+            f[8 * i + 2 * j + 1] = (float) (hi >= 8 ? hi - 16 : hi) * scale;
+        }
+}
+// A warp's row-wide codec: the lane's four values' group scale, and the lane's two code bytes.
+__device__ __forceinline__ void v4_scales(const float (&v)[4], float f, int lane, float (&s)[kKvV4Groups]) {
+    constexpr int kLanesPerGroup = kKvV4Group / 4;
+    float a = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
+#pragma unroll
+    for (int m = 1; m < kLanesPerGroup; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    s[lane / kLanesPerGroup] = __half2float(__float2half_rn(a / kV4CodeMaxMag));   // the fp16 value the row stores
+}
+__device__ __forceinline__ void store_v4(void* row, int lane, const float (&v)[4], const float (&s)[kKvV4Groups]) {
+    const int idx0 = lane * 4;
+    const int group = idx0 / kKvV4Group;
+    const float sc = s[group];
+    uint8_t* codes = static_cast<uint8_t*>(row);
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const int lo = v4_e2m1_code(sc > 0.f ? v[2 * b] / sc : 0.f);
+        const int hi = v4_e2m1_code(sc > 0.f ? v[2 * b + 1] / sc : 0.f);
+        codes[(size_t) (idx0 / 2 + b)] = (uint8_t) ((lo & 0xF) | ((hi & 0xF) << 4));
+    }
+    if (idx0 % kKvV4Group == 0)
+        reinterpret_cast<__half*>(codes + kKvV4CodeBytes)[group] = __float2half_rn(sc);
+}
+
+
 template <bool Scaled = true>
 __device__ __forceinline__ void unpack16_int8_h2(const uint4 u, __half2 scale, uint32_t (&h)[8]) {
     const uint32_t w[4] = {u.x ^ 0x80808080u, u.y ^ 0x80808080u, u.z ^ 0x80808080u, u.w ^ 0x80808080u};
@@ -168,7 +243,7 @@ __device__ __forceinline__ uint4 fp8x8_to_f16x8(uint2 u) {
     return *reinterpret_cast<const uint4*>(h);
 }
 
-template <bool FP8, bool INT8, bool SkipDeep = false>
+template <bool FP8, bool INT8, bool SkipDeep = false, bool V4 = false>
 __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
                                                                  float* __restrict__ part_acc) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -187,24 +262,37 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
     constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kVRowBytes = V4 ? kKvV4RowBytes : kRowBytes;   // [V4] the value row may be shorter than the key's
+    constexpr int kNScales = V4 ? kKvV4Groups : 2;               // [V4] one scale a 32-value group, not two a row
     const bk::WindowSegs& at = seg_table(a.seg);
     const SegCaches& sc = a.seg.c[bk::seg_of(at, r)];   // a batch window's row: its conversation's caches
     const uint8_t* kbase = static_cast<const uint8_t*>(at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
-    const uint8_t* vbase = static_cast<const uint8_t*>(at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kVRowBytes;
     const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
     uint32_t* vrow = sm.v[w][lane];
-    constexpr int kVRegs = (FP8 || INT8) ? kLoads : 1;
-    const auto load_k_and_v = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kVRegs], float (&ks)[2], float (&vs)[2]) {
+    constexpr int kVRegs = (FP8 || INT8 || V4) ? kLoads : 1;
+    const auto load_k_and_v = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kVRegs], float (&ks)[2], float (&vs)[kNScales]) {
         const int key = t0 + lane;
         const bool valid = key < s_hi;
-        ks[0] = ks[1] = vs[0] = vs[1] = 1.f;
+        ks[0] = ks[1] = vs[0] = 1.f;
+        if constexpr (V4) {
+#pragma unroll
+            for (int i = 1; i < kNScales; ++i) vs[i] = 1.f;
+        } else {
+            vs[1] = 1.f;
+        }
         const size_t cell = valid ? (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes : 0;
+        const size_t vcell = valid ? (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kVRowBytes : 0;
         const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
-        const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
+        const uint4* vp = reinterpret_cast<const uint4*>(vbase + vcell);
         if (valid) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
-            if constexpr (!FP8 && !INT8) {
+            if constexpr (V4) {   // [V4] 64 code bytes: four 16-byte loads, each one 32-value scale group
+#pragma unroll
+                for (int i = 0; i < kHeadDim / 32; ++i) vr[i] = __ldg(vp + i);
+                v4_row_scales(vbase + vcell, vs);
+            } else if constexpr (!FP8 && !INT8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vp + i, true);
                 asm volatile("cp.async.commit_group;" ::: "memory");
@@ -232,7 +320,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
     const int t_first = s_lo + w * kTile;
     uint4 kr[kLoads];
     uint4 vr[kVRegs];
-    float ks[2], vs[2];
+    float ks[2], vs[kNScales];
     if (t_first < s_hi) load_k_and_v(t_first, kr, vr, ks, vs);
     for (int i = threadIdx.x; i < kGroup * kHeadDim; i += blockDim.x)
         sm.q[i / kHeadDim][i % kHeadDim] = a.q[((size_t) r * kHeads + g * kGroup) * kHeadDim + i];
@@ -284,8 +372,16 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
         }
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) sc[h] = valid ? sc[h] * a.scale + b_acc[h] : -INFINITY;
-        // INT8 and FP8 convert V into sm.v[w][lane]; FP16 V is already streaming via cp.async
-        if constexpr (INT8) {
+        // INT8, FP8 and V4 convert V into sm.v[w][lane]; FP16 V is already streaming via cp.async
+        if constexpr (V4) {   // [V4] four-bit codes and their per-group scale, straight to fp16 pairs
+#pragma unroll
+            for (int i = 0; i < kHeadDim / 32; ++i) {
+                uint32_t h[16];
+                unpack32_v4(vr[i], vs[i], h);
+#pragma unroll
+                for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
+            }
+        } else if constexpr (INT8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
                 uint32_t h[8];
@@ -1116,7 +1212,7 @@ struct FusedSmem {
     float pacc[kGroup][kHeadDim];
 };
 
-template <bool FP8, bool INT8, int ROWS>
+template <bool FP8, bool INT8, int ROWS, bool V4 = false>
 __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -1126,6 +1222,8 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
     constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kVRowBytes = V4 ? kKvV4RowBytes : kRowBytes;   // [V4] the value row may be shorter than the key's
+    constexpr int kNScales = V4 ? kKvV4Groups : 2;               // [V4] one scale a 32-value group, not two a row
     // before the wait: the positions (staged before the window), the slice, the warp's tile and what of it is older than
     // the window, and the weights
     int p, lo, n;
@@ -1137,20 +1235,27 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     const int key = s_lo + w * kTile + lane;
     const bool valid = active && key < s_hi;
     const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
-    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kVRowBytes;
     const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
-    constexpr int kVRegs = (FP8 || INT8) ? kLoads : 1;
+    constexpr int kVRegs = (FP8 || INT8 || V4) ? kLoads : 1;
     uint4 kr[kLoads];
     uint4 vr[kVRegs];
-    float ks[2] = {1.f, 1.f}, vs[2] = {1.f, 1.f};
+    float ks[2] = {1.f, 1.f}, vs[kNScales];
+#pragma unroll
+    for (int i = 0; i < kNScales; ++i) vs[i] = 1.f;
     const bool old_kv = valid && key < p0;
     if (old_kv) {
         const size_t cell = (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes;
+        const size_t vcell = (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kVRowBytes;
         const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
-        const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
+        const uint4* vp = reinterpret_cast<const uint4*>(vbase + vcell);
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
-        if constexpr (!FP8 && !INT8) {
+        if constexpr (V4) {   // [V4] 64 code bytes: four 16-byte loads, each one 32-value scale group
+#pragma unroll
+            for (int i = 0; i < kHeadDim / 32; ++i) vr[i] = __ldg(vp + i);
+            v4_row_scales(vbase + vcell, vs);
+        } else if constexpr (!FP8 && !INT8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vp + i, true);
             asm volatile("cp.async.commit_group;" ::: "memory");
@@ -1203,6 +1308,34 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                     if (k >= nr) break;
                     const int rr = rr0 + k;
                     uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
+                    if constexpr (V4) {
+                        if (w) {   // [V4] a value row is four-bit and per-32-value scaled
+                            float s4[kKvV4Groups];
+                            const float vv[4] = {val[k][0] * f[k], val[k][1] * f[k], val[k][2] * f[k], val[k][3] * f[k]};
+                            v4_scales(vv, 1.f, lane, s4);   // f is already in the values
+                            store_v4(row, lane, vv, s4);
+                            if (rr == r) {   // the block's own row: into the cache and the ring
+                                void* cache_row = static_cast<uint8_t*>(pa.v_cache) +
+                                                  ((size_t) (p % pa.cap) * kKvHeads + g) * (size_t) kVRowBytes;
+                                store_v4(cache_row, lane, vv, s4);
+                                float* ring = pa.v_ring;
+                                *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
+                                    make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
+                            }
+                        } else {   // the keys keep their own format
+#pragma unroll
+                            for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
+                            if (rr == r) {
+                                void* cache_row = static_cast<uint8_t*>(pa.k_cache) +
+                                                  ((size_t) (p % pa.cap) * kKvHeads + g) * (size_t) kRowBytes;
+#pragma unroll
+                                for (int u = 0; u < 4; ++u) prep::store_kv(cache_row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
+                                float* ring = pa.k_ring;
+                                *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
+                                    make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
+                            }
+                        }
+                    } else {
 #pragma unroll
                     for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
                     if (rr == r) {   // the block's own row: into the cache and the ring
@@ -1214,6 +1347,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                         float* ring = w ? pa.v_ring : pa.k_ring;
                         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
                             make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
+                    }
                     }
                 }
             }
@@ -1230,7 +1364,11 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             const uint4* vp = reinterpret_cast<const uint4*>(fs.vw[key - p0]);
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
-            if constexpr (!FP8 && !INT8) {
+            if constexpr (V4) {   // [V4] the staged value row is four-bit too
+#pragma unroll
+                for (int i = 0; i < kHeadDim / 32; ++i) vr[i] = vp[i];
+                v4_row_scales(fs.vw[key - p0], vs);
+            } else if constexpr (!FP8 && !INT8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(sm.v[w][lane] + 4 * i) = vp[i];
             } else {
@@ -1279,7 +1417,15 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                 sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
             }
             uint32_t* vrow = sm.v[w][lane];
-            if constexpr (INT8) {
+            if constexpr (V4) {   // [V4] four-bit codes and their per-group scale, straight to fp16 pairs
+#pragma unroll
+                for (int i = 0; i < kHeadDim / 32; ++i) {
+                    uint32_t h[16];
+                    unpack32_v4(vr[i], vs[i], h);
+#pragma unroll
+                    for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
+                }
+            } else if constexpr (INT8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) {
                     uint32_t h[8];
@@ -1693,11 +1839,14 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
         cudaFuncSetAttribute(attn_split_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         cudaFuncSetAttribute(attn_split_kernel<false, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<false, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<true, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<false, true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         set = true;
 
     }
     const bool seg_mode = a.seg.at.n > 0 || a.seg.at_d != nullptr;
-    const bool use_mma = !a.int8;
+    const bool use_mma = !a.int8 && !a.v4;   // [V4] the MMA kernels read 16-byte K/V rows
     const int mma_z = a.window > 0 ? kWindowMmaSplits : z;
     if (use_mma) {
         const int nseg = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? std::min(rows, (int) bk::kWindowSegsMax) : 1);
@@ -1738,6 +1887,10 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
                 if (forced && forced->resident == 0) return false;
                 launch_mma<2>(a, rows, mma_min_keys, max_keys, z, part_ml, part_acc, s, device, forced, info, shards, shard_count);
             }
+        } else if (a.v4) {   // [V4] the keys in their own format, the values four-bit
+            if (a.int8) bk::launch_pdl(attn_split_kernel<false, true, false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+            else if (a.fp8) bk::launch_pdl(attn_split_kernel<true, false, false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+            else bk::launch_pdl(attn_split_kernel<false, false, false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
         } else if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
         else if (a.fp8) bk::launch_pdl(attn_split_kernel<true, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
         else bk::launch_pdl(attn_split_kernel<false, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
@@ -1797,15 +1950,29 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
         cudaFuncSetAttribute(attn_fused_kernel<false, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
         cudaFuncSetAttribute(attn_fused_kernel<true, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
         cudaFuncSetAttribute(attn_fused_kernel<false, true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<false, false, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<true, false, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, true, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<false, false, 3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<true, false, 3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        cudaFuncSetAttribute(attn_fused_kernel<false, true, 3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
     if (rows <= 2) {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        if (a.v4) {   // [V4] four-bit value rows
+            if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 2, true>, grid, dim3(kWarps * 32), smem, s, pa, a);
+            else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 2, true>, grid, dim3(kWarps * 32), smem, s, pa, a);
+            else bk::launch_pdl(attn_fused_kernel<false, false, 2, true>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        } else if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
         else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
         else bk::launch_pdl(attn_fused_kernel<false, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
     } else {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        if (a.v4) {   // [V4] four-bit value rows
+            if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 3, true>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+            else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 3, true>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+            else bk::launch_pdl(attn_fused_kernel<false, false, 3, true>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        } else if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
         else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
         else bk::launch_pdl(attn_fused_kernel<false, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
     }

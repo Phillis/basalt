@@ -156,6 +156,64 @@ __device__ __forceinline__ void kv_rows(const AttnPrep& a, int r0, int n, int pr
     }
 }
 
+__device__ __forceinline__ float v4_e2m1_mag(int i) {
+    return i == 0 ? 0.f : i == 1 ? 0.5f : i == 2 ? 1.f : i == 3 ? 1.5f : i == 4 ? 2.f : i == 5 ? 3.f : i == 6 ? 4.f : 6.f;
+}
+__device__ __forceinline__ int v4_e2m1_code(float x) {   // nearest code; bit 3 is the sign
+    const float a = fabsf(x);
+    const int i = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return (x < 0.f ? 8 : 0) | i;
+}
+__device__ __forceinline__ float v4_e2m1_value(int code) {
+    const float m = v4_e2m1_mag(code & 7);
+    return (code & 8) ? -m : m;
+}
+__device__ __forceinline__ void v4_scales(const float (&v)[4], float f, int lane, float (&scale)[kKvV4Groups]) {
+    constexpr int kLanesPerGroup = kKvV4Group / 4;
+    float a = 0.f;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) a = fmaxf(a, fabsf(v[u] * f));
+#pragma unroll
+    for (int m = 1; m < kLanesPerGroup; m <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+    scale[lane / kLanesPerGroup] = __half2float(__float2half_rn(a / kV4CodeMaxMag));   // the fp16 value the row stores
+}
+
+// [V4] A lane's four consecutive values as two code bytes plus the group's scale; the lane holding a group's first
+// value writes its fp16 scale after the codes.  Each byte belongs to one lane, so no two lanes write the same byte.
+__device__ __forceinline__ void store_v4(void* row, int lane, const float (&v)[4], const float (&scale)[kKvV4Groups]) {
+    const int idx0 = lane * 4;
+    const int group = idx0 / kKvV4Group;
+    const float s = scale[group];
+    uint8_t* codes = static_cast<uint8_t*>(row);
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const int lo = v4_e2m1_code(s > 0.f ? v[2 * b] / s : 0.f);
+        const int hi = v4_e2m1_code(s > 0.f ? v[2 * b + 1] / s : 0.f);
+        codes[(size_t) (idx0 / 2 + b)] = (uint8_t) ((lo & 0xF) | ((hi & 0xF) << 4));
+    }
+    if (idx0 % kKvV4Group == 0)
+        reinterpret_cast<__half*>(codes + kKvV4CodeBytes)[group] = __float2half_rn(s);
+}
+
+// [V4] 16 values of a row from its eight code bytes and their scale, as fp32.
+__device__ __forceinline__ void unpack16_v4(const uint2 u, float scale, float (&f)[16]) {
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {   // four bytes a word, a byte a pair of values
+            const int lo = (int) ((w[i] >> (8 * j)) & 0xF), hi = (int) ((w[i] >> (8 * j + 4)) & 0xF);
+            f[8 * i + 2 * j] = (float) (lo >= 8 ? lo - 16 : lo) * scale;
+            f[8 * i + 2 * j + 1] = (float) (hi >= 8 ? hi - 16 : hi) * scale;
+        }
+}
+
+// [V4] A row's fp16 scales (after its codes) as fp32.
+__device__ __forceinline__ void v4_row_scales(const uint8_t* row, float (&s)[kKvV4Groups]) {
+#pragma unroll
+    for (int g = 0; g < kKvV4Groups; ++g) s[g] = __half2float(reinterpret_cast<const __half*>(row + kKvV4CodeBytes)[g]);
+}
+
 __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t idx, float v, const float (&scale)[2], int lane) {
     if (int8) {
         const int group = (int) idx / 64;

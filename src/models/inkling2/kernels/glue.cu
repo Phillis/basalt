@@ -228,16 +228,24 @@ __device__ __forceinline__ void kv_read_ahead(const MixNorm& a) {
     const int n = p0 - lo;
     if (n <= 0 || n > kKvAheadCells) return;
     const int64_t c0 = lo % a.kv_cap, run1 = min((int64_t) n, a.kv_cap - c0), run2 = n - run1;
-    const uint64_t b1 = (uint64_t) run1 * a.kv_cell, b2 = (uint64_t) run2 * a.kv_cell;
+    // [V4] each plane its own cell: a four-bit value cell is shorter, and reading it at the key's stride runs off its end
+    const uint64_t cell_of[2] = {(uint64_t) a.kv_cell, (uint64_t) (a.kv_cell_v > 0 ? a.kv_cell_v : a.kv_cell)};
+    const char* base_of[2] = {(const char*) a.kv_k, (const char*) a.kv_v};
     constexpr uint64_t kPiece = 32768;
-    const uint64_t n1 = (b1 + kPiece - 1) / kPiece, n2 = (b2 + kPiece - 1) / kPiece;
-    for (uint64_t j = threadIdx.x; j < 2 * (n1 + n2); j += blockDim.x) {
-        const char* base = (const char*) (j < n1 + n2 ? a.kv_k : a.kv_v);
-        const uint64_t i = j % (n1 + n2);
-        const uint64_t start = i < n1 ? (uint64_t) c0 * a.kv_cell + i * kPiece : (i - n1) * kPiece;
-        const uint64_t end = i < n1 ? (uint64_t) c0 * a.kv_cell + b1 : b2;
+    uint64_t b1[2], b2[2], pieces[2];
+    for (int p = 0; p < 2; ++p) {
+        b1[p] = (uint64_t) run1 * cell_of[p];
+        b2[p] = (uint64_t) run2 * cell_of[p];
+        pieces[p] = (b1[p] + kPiece - 1) / kPiece + (b2[p] + kPiece - 1) / kPiece;
+    }
+    for (uint64_t j = threadIdx.x; j < pieces[0] + pieces[1]; j += blockDim.x) {
+        const int p = j < pieces[0] ? 0 : 1;
+        const uint64_t i = p ? j - pieces[0] : j;
+        const uint64_t n1 = (b1[p] + kPiece - 1) / kPiece;
+        const uint64_t start = i < n1 ? (uint64_t) c0 * cell_of[p] + i * kPiece : (i - n1) * kPiece;
+        const uint64_t end = i < n1 ? (uint64_t) c0 * cell_of[p] + b1[p] : b2[p];
         const uint64_t take = min(kPiece, end - start);
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base + start), "r"((unsigned) take) : "memory");
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base_of[p] + start), "r"((unsigned) take) : "memory");
     }
 }
 
@@ -492,10 +500,18 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
         void* cache = w ? (b ? sc.v : a.v_cache) : (b ? sc.k : a.k_cache);
         float val[4], raw[4], f, scale[2] = {};
         prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f, ring, b ? at.row0[k] : 0, scale);
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
-        void* row = static_cast<uint8_t*>(cache) + ((size_t) (p % a.cap) * kKvHeads + g) * row_bytes;
+        const size_t k_row = (size_t) (a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim);
+        const size_t row_bytes = w && a.v4 ? (size_t) kKvV4RowBytes : k_row;   // [V4] the value row may be shorter
+        void* row = static_cast<uint8_t*>(cache) + ((size_t) (a.v4 ? (p % a.cap) : (p % a.cap)) * kKvHeads + g) * row_bytes;
+        if (a.v4 && w) {   // [V4] a value row: four-bit codes, a scale per group
+            const float vv[4] = {val[0] * f, val[1] * f, val[2] * f, val[3] * f};
+            float s4[kKvV4Groups];
+            prep::v4_scales(vv, 1.f, lane, s4);
+            prep::store_v4(row, lane, vv, s4);
+        } else {
 #pragma unroll
-        for (int u = 0; u < 4; ++u) prep::store_kv(row, a.fp8, a.int8, lane * 4 + u, val[u] * f, scale, lane);
+            for (int u = 0; u < 4; ++u) prep::store_kv(row, a.fp8, a.int8, lane * 4 + u, val[u] * f, scale, lane);
+        }
         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
             make_float4(raw[0], raw[1], raw[2], raw[3]);
         return;
