@@ -19,6 +19,9 @@ struct SlotWin {
     std::vector<int32_t> win, out, history;
     float chance[basalt::spec::DraftPolicy::kMaxT] = {};
     Clock::time_point round0;
+    // [Item 2] the round's time this window owns: in a group the slots share the round, and charging each slot the
+    // whole of it makes the policy think its own window is twice as expensive as it is (it then shortens it)
+    double ms_share = 0.0;
     basalt::model::DecodeRequest d;
     // set by slot_window_accept: the accepted drafts, the rows the slot keeps, the tokens' line, the finish reason, the
     // drafts to start next
@@ -192,7 +195,9 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
             std::printf("ERR %s\n", r.message.c_str());
             return false;
         }
-        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
+        const double ms = w.ms_share > 0.0
+                              ? w.ms_share
+                              : std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
         if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);
         else bpolicy->observe_window(w.chance, T, a, ms);
     }
@@ -307,6 +312,13 @@ bool Runtime::batch_round() {
             for (const size_t i : group) wins[i].drafting = r.ok() && wins[i].want > 0;
         }
         stats_lookups_end();
+        {   // [Item 2] attribute the group's time to its windows by rows: a row costs the same whichever slot it belongs to
+            const double group_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            int total = 0;
+            for (const size_t i : group) total += rows[i];
+            for (const size_t i : group)
+                wins[i].ms_share = total > 0 ? group_ms * (double) rows[i] / (double) total : group_ms;
+        }
         for (const size_t i : group)
             if (!slot_window_end(act[i], wins[i])) return false;
     }
