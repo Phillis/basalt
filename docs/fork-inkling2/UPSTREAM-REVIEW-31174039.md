@@ -102,3 +102,136 @@ batched DSpark are what they claim, that wait is the first thing that should mov
 
 Nothing in this review has been merged. The tree is clean at `f0e377ff`; `origin/main` is fetched and available as
 `31174039`.
+## Stage 1 EXECUTED: upstream as the base, our card spare, the v4 plumbing staged (branch `merge-upstream`, bf330c03)
+
+Branch `merge-upstream` from `origin/main` (`31174039`), pushed to the fork as `merge-upstream-31174039`. The live
+engine stays on `pr650-int` (`7e2f3c54`) until the v4 codec lands - the merged build is not yet strictly better.
+
+### What upstream gets by itself, measured at the best configuration it can run
+
+Upstream only knows `kv == fp8|int8|fp16` (its adapter rejects anything else), and at two slots its fp8 plan does
+not fit 2 x 128k: with `vram-reserve-mib 0` it is **83 MiB short** ("even with every expert in RAM the card is
+83 MiB short"). Its best 2-slot configuration here is **2 x 96k fp8** (`cuda0=3.3GiB ram=11.9GiB`):
+
+    gate        Gate 0 correct
+    prose       40.8 / 39.1 tok/s per stream, hit 63-71%
+    prefill     1,190 / 1,186 t/s per stream (two 30k prompts at once)
+    curve       30k: prefill 1,814, decode 38.2      64k: prefill 1,660, decode 50.9
+
+### What the merge adds
+
+1. **`kCardSpare` 1024 -> 768 MiB.** The value we measured on our tree (+6% decode at two slots). It is also what
+   makes 2 x 128k reachable on upstream at all: at 1024 the plan is 83 MiB short, at 768 it loads with
+   `cuda0=2.1GiB ram=13.1GiB` and passes Gate 0 (391, Tokyo, planets, 144/12).
+2. **The four-bit value cache's plumbing, staged and dormant** (~105 lines, no codec): `kernels.hpp`'s V4 constants,
+   `kv_v_row_bytes`/`kv_pair_bytes` and the two `v4` flags; `model.cpp`'s `kv == "fp8v4"` parse, `fp8_`/`v4_` and the
+   per-position pair bytes in `visit_cache_bytes`/`session_bytes`/the split spec; `session.cpp`'s `v_row_bytes()`,
+   `v_cell_bytes()`, `cell_bytes_at(i)` and the per-array elastic open/ensure/count/trim (upstream charges **every**
+   array the key's row size, which is what capped a v4 slot at 62.5% of its context); `stage_to_ring`'s separate
+   value row size (its kernel copied both planes with one piece count, so an 80-byte value cell needed its own);
+   the adapter accepting `kv=fp8v4`. **With `kv=fp8` every one of these is inert** (`v_row_bytes()` returns the key
+   row, `cell_bytes_at()` returns `cell_bytes()`), which is why stage 1 can ship without the codec.
+
+### Gates on the merged build (2 x 128k, kv=fp8, chunk 5120, reserve 256)
+
+    parities    prompt_parity 0 failures, kernels_parity 0 failures, gqa_window_parity PASS
+    needles     3/3 at 64,016 tokens, 3/3 at 119,960 tokens, each with a concurrent decoder
+    stress      10 rounds, 0 crashes
+    gate 0      correct
+
+### Numbers, and the reason the merge is not live yet
+
+    prefill     1,753 t/s per stream at 30k, 1,606 at 64k; two 30k prompts at once 1,146 per stream
+    decode      40.6 per stream at 30k, 51.6 at 64k (curve); prose 38.0 / 38.4; hit 63-79%
+
+Against our tree (fp8v4, 2 x 128k): prefill 1,705 / 1,500 - **merged +2.8% / +7.1%**; decode 46.2 / 44.9 -
+**merged -12% at 30k, +15% at 64k**.
+
+The 30k loss is entirely the copies. fp8 value rows are 128 B against fp8v4's 80, so the KV of two 128k slots costs
+~1.1 GiB more and the expert copy room shrinks; the hit rate falls from our 83-96% to 63-79% and decode follows.
+That is exactly the gap the four-bit codec closes - which is why **stage 2 is the codec, not more tuning**.
+
+### A false pass worth recording
+
+Running `kv=fp8v4` with the staged sizes but upstream's unported kernels answers Gate 0 correctly (391, Tokyo).
+It is **wrong**: those kernels store and load value rows at the key's stride, so they write 128 bytes into an
+80-byte cell and read it back self-consistently, overrunning into neighbouring allocations. Two right answers is
+not evidence. This is the reason the v4 port is gated on parity tests and needles rather than on Gate 0.
+
+### Stage 2, the remaining work (the codec in upstream's rewritten attention)
+
+Upstream rewrote `attn.cu` (+957) and `attn_prompt.cu` (+480): a `template <bool FP8, bool INT8, bool SkipDeep>`
+tile loader with **one** `kRowBytes` for both planes, `template <bool FP8, int BM>` kernels, an MMA
+`mma_store_value_piece` path, and dispatch instantiations `attn_split_kernel<...>` x4 / `attn_fused_kernel<...,2/3>`
+x6. The port is:
+
+  a. `prep.cuh`'s value store: a `store_v4` that packs E2M1 codes and the per-row FP16 scale at 80 bytes a row.
+  b. Both kernels' value load: a `V4` template parameter threaded beside `FP8`/`INT8` (doubling the instantiations),
+      with the v4 unpack in place of the E4M3 cast and `vbase` on the value row size.
+  c. `attn_prompt.cu`'s value load, same treatment.
+  d. `kernels_parity` / `prompt_parity` v4 cases, and then the full gate: Gate 0, parities, needles 3/3 at 64k and
+     120k, 262,144 loads, an 83k prompt, stress 20.
+
+The codec itself is self-contained device code already written for our tree (`v4_e2m1_code`/`mag`/`value`,
+`v4_row_scales`, `unpack32_v4`, `unpack16_v4`, `v4_scales`, `store_v4`) and can be re-used verbatim.
+
+## Stage 2 porting map: the four-bit codec into upstream's rewritten attention
+
+The reference implementation already exists in **our tree** (`pr650-int`, `7e2f3c54`) - the codec is a `V4` template
+parameter there, and upstream's rewrite is a different shape, so this is a re-application rather than a cherry-pick.
+
+### The reference, by symbol and line (ours @ 7e2f3c54)
+
+    src/models/inkling2/kernels/prep.cuh      (the store side; attn.cu keeps its own copy because it does not include prep.cuh)
+      L184  v4_e2m1_mag(i)                     the E2M1 magnitude table 0, .5, 1, 1.5, 2, 3, 4, 6
+      L187  v4_e2m1_code(x)                    nearest code, bit 3 is the sign
+      L192  v4_e2m1_value(code)                code -> float
+      L196  v4_scales(v, f, lane, scale)       one FP16 scale per 32 values, from a lane's 4 values
+      L208  store_v4(row, lane, v, scale)      packs 8 lanes' 4 values into 16 bytes + the group's scale at kKvV4CodeBytes
+      L224  unpack16_v4(u, scale, f[16])       the decode, 16 values from one 16-byte load
+      L237  v4_row_scales(row, s[8])           the 8 group scales of a row
+
+    src/models/inkling2/kernels/attn.cu       (the load side)
+      L47-58                                   the codec again (v4_e2m1_code/mag/value)
+      L139-195                                 v4_row_scales, unpack32_v4 (32 values of one 16-byte load as fp16 pairs),
+                                               unpack16_v4, v4_scales, store_v4
+      L233  template <bool FP8, bool INT8, bool V4>   the split kernel
+      L249  constexpr int kVRowBytes = V4 ? kKvV4RowBytes : kRowBytes;
+      L250  constexpr int kNScales   = V4 ? kKvV4Groups   : 2;
+      L258, 266-273                            the tile loader: `if constexpr (V4)` 64 code bytes = four 16-byte loads,
+                                               each one 32-value group, plus v4_row_scales into vs[8]
+      L343-347                                 the dot: `unpack32_v4(vr[i], vs[i], h)` instead of the E4M3 cast
+      L728  template <bool FP8, bool INT8, bool V4, int ROWS>   the rows kernel
+      L738-739, 754-769                        the same two constexprs and the same loader branch
+      L811-816                                 the store: v4_scales(vv, 1.f, lane, s4) then store_v4(row, lane, vv, s4)
+
+    src/models/inkling2/kernels/attn_prompt.cu  the prompt path: the same three pieces (kVRowBytes, the loader branch,
+                                                the decode) inside the prompt tile loop.
+
+### The edits, in order, on branch `merge-upstream`
+
+1. **`prep.cuh`** - copy our L184-240 block verbatim after upstream's INT8 store helpers, and thread a `V4` template
+   parameter into upstream's value store the way we did (the store writes `kKvV4RowBytes` = 80 B per value row).
+2. **`attn.cu`** - our L47-58 + L139-195 blocks verbatim (they are self-contained device code). Then, at upstream's
+   L247 (`kRowBytes`/`kLoads`, split kernel) and L492 (`kRowBytes`, its second kernel), add `kVRowBytes`/`kNScales`
+   alongside, add `V4` to the template parameter list, branch the tile loader and the value math on `if constexpr (V4)`,
+   and put `vbase`/`vcell` on `kVRowBytes`. Upstream's new `mma_store_value_piece` path must be left to the non-v4
+   formats: our own rule already is `use_mma = window == 0 && !int8 && !v4`.
+3. **Dispatch** - upstream instantiates `attn_split_kernel<false,false>/<true,false>/<false,true>/<false,true,true>` and
+   `attn_fused_kernel<...,2>/<...,3>`; each needs a `V4=false` argument and a `V4=true` sibling (4 -> 8, 6 -> 12), and
+   the launcher picks it from `a.v4`.
+4. **`attn_prompt.cu`** - same three pieces in its prompt loop.
+5. **Tests** - `kernels_parity` and `prompt_parity` gain v4 cases beside their fp8/int8 ones (the existing harnesses
+   already iterate over the formats; ours adds `"fp8v4"` to that list).
+
+### The gate, unchanged from the v4 work
+
+`kernels_parity` 0 failures, `prompt_parity` 0 failures, `gqa_window_parity` PASS, Gate 0, needles 3/3 at 64k and
+3/3 at 120k with a concurrent decoder, a 262,144-token load, an 83k prompt, then stress 20 rounds - and only then the
+numbers against the bar in the stage-1 section (merged fp8: prefill 1,753 / 1,606, decode 40.6 / 51.6, hit 63-79%;
+our tree: 1,705 / 1,500, 46.2 / 44.9, hit 83-96%).
+
+### The one thing NOT to do
+
+Do not run `kv=fp8v4` with the staged sizes and an unported attention to "see if it works". It answers Gate 0
+correctly while writing 128-byte value rows into 80-byte cells (see the false pass above). Verify with needles.
