@@ -635,8 +635,14 @@ private:
     Flow restore_image() override {
         const int64_t positions = (int64_t) incoming->live.ids.size();
         // a conversation stored by a build whose running state had another layout is read again, not mounted
-        bool sized = incoming->live.state_a.size() == rt_.session().running_bytes();
-        for (const ConvCheckpoint& c : incoming->checkpoints) sized = sized && c.state_a.size() == rt_.session().running_bytes();
+        // [R1] The yardstick is what running_state() produces - an image carries that, not running_bytes(), which also
+        // counts the elastic caches an image keeps in its own cells. Comparing against running_bytes() rejected every
+        // parked conversation at two slots (98,050,048 bytes against 113,901,568), so a restart re-read its whole context.
+        basalt::core::RunningState probe;
+        const bool probed = rt_.session().running_state(positions, false, probe).ok();
+        const size_t want = probed ? probe.bytes() : 0;
+        bool sized = want > 0 && incoming->live.state_a.size() == want;
+        for (const ConvCheckpoint& c : incoming->checkpoints) sized = sized && c.state_a.size() == want;
         basalt::model::Result r = sized ? rt_.session().restore_cells(incoming->kv, positions)
                                         : basalt::model::Result{basalt::model::Status::Error, "its running state has another size"};
         if (r.ok()) r = rt_.restore_running_from(incoming->live.state_a, positions);
