@@ -21,9 +21,5 @@
         "port": 8080,
         "open": false,
         "allowed-host": "*"
-    },
-    "engine": {
-        "conversation-cache-disk-mib": 4096,
-        "conversation-cache-dir": "C:\\LLM\\basalt-conv-cache"
     }
 }

@@ -74,3 +74,21 @@ power-throttled: a cooling pad or the vendor's performance mode is worth an esti
    `copy_from_slot`/`copy_to_slot` are stubs in inkling2).
 4. **The FP4 GEMM** (~20 effective TFLOPS, prefill's compute half) and an `ncu` pass on the card expert kernels.
 5. The tool-call and reasoning-echo harness variants (code exists in `tools/agent_turns.py`).
+## After SPEC-2SLOT-BUDGET-PHASE (D1, D2, P1, D2-closures, R1 partial)
+
+- **D1 closed**: `--pool-workers` (7/11/14; 14 is +7.6% at 2k and -6.2% at 64k) and `kTasksPerThread` (12/6/4/2; 4 is
+  +3.7% cold and -1% warm over four interleaved rounds) both sit inside the harness's +/-10% band, so the defaults
+  stand. The per-visit pool wait from Item 1's profile is **154 us median, 442 us average** against 246 us of
+  card-expert work it could hide behind - the CPU term is per-visit latency, not bandwidth.
+- **D2 closed**: the "71% slot" does not reproduce - three processes gave 95.8/73.2, 88.8/93.5, 86.2/90.1, and across
+  the session the low slot has appeared in either position. It is content and which experts the heat-ranked copy set
+  holds, not a bias.
+- **The `kElasticKeep` paradox explained**: it only enters `ensure_positions()`, which a 2k context never reaches, so
+  the 2k gain was noise; at 64k the grow demotes more copies with a smaller keep-free, which is the 44 -> 30.
+- **P1 measured**: a 30k read is 12.2 s alone and 12.5 s while the other slot decodes (2.5% worse), and its staging is
+  **38% of a chunk** (767 ms of ~2,030 ms). **P2 closed**: hiding it needs a second staging set that the plan cannot
+  fit at 2 x 128k ("needs 2366 MiB a session").
+- **R1 partial**: the disk cache's mount compared the image against `running_bytes()` instead of what
+  `running_state()` produces (98,050,048 vs 113,901,568), which rejected every parked conversation; fixed, the guard
+  passes, and the next blocker is `restore_cells()`' cell write-back ("writing a cache back failed"). The cache stays
+  off by default until that lands.

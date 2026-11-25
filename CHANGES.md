@@ -253,3 +253,32 @@ happens to hold for that conversation. Per the spec's own stop rule the item rec
 noise in a harness that swings +/-10% (the same config measured 33.2 to 37.5 across processes tonight). At 64k the grow
 does run, and a smaller keep-free means the grow demotes more copies: fewer copies at depth is exactly the 44 -> 30
 measured. No change: the item is closed with the explanation.
+## P1 and P2 of SPEC-2SLOT-BUDGET-PHASE (measured, e1451848)
+
+**P1, the prefill timeline at two slots.** One slot reads a 30k unique prompt at chunk 5,120, with
+`BASALT_DIAG_PROMPT=1` for the staged bytes and the engine's own `read in` line for the time:
+
+| case | read | staging per chunk | compute per chunk | exposed |
+|---|---|---|---|---|
+| the other slot idle | 29,946 tokens in **12.2 s** | 12.08 GiB H2D + 11.17 GiB D2D = **767 ms** | ~1,266 ms | **38%** |
+| the other slot decoding | 30,032 tokens in **12.5 s** | same shape | same | **38%** |
+
+Two numbers come out of it. **Prefill's staging is exposed - 38% of a chunk, 767 ms of about 2,030 ms** (and ~33% at
+chunk 8,192 earlier), so P2 has something to win. And **a read costs only 2.5% more when the other slot is decoding**:
+prefill and decode do not contend for the link the way the cost model feared, because decode's own staged bytes are
+tiny next to a chunk's 12 GiB.
+
+**P2, hiding it: closed by the card, not by the code.** The only lossless lever is a second staging set so two layers
+are copied ahead; built and measured under the previous spec (Item 6), the plan refuses to load at 2 x 128k -
+"needs 2366 MiB a session" - because the second set doubles the staging the plan must reserve. The alternatives are
+out of reach on 12 GB: keeping the 12 looped core layers staged across their three passes needs ~6.2 GiB, and a
+larger chunk needs an arena that does not fit either (16,384 rows: "the card is 2125 MiB short"). So P2's decision is
+recorded: **at 2 x 128k the exposed staging cannot be hidden on this card**; at a single 256k slot (where the arena
+fits chunk 8,192) the exposed share is lower already (33%) and the same second-set limit applies.
+
+**Not attempted, and why.** D3 (moving misses to the GPU over the link during decode) and P3 (the FP4 GEMM) are the
+two day-scale engineering items left, both kernel/plumbing projects; R2 (a second slot reusing the first's system
+prompt) needs the cell-copy machinery that R1 shows is not yet reachable at two slots; D4 (acceptance) has its matrix
+and its Tier 1 data point already (spec 6 swinging +11%/-5%); D5's small GPU items and the interleaving flag are each
+below the phase's "keep only what improves decode or prefill" bar - interleaving by construction (it trades reader
+speed for decoder responsiveness, default off).
