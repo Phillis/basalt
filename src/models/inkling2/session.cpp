@@ -940,14 +940,18 @@ public:
         if (!m_.publish_loan(stream_, at)) return false;
         const auto& pairs = m_.loaned_pairs();
         if (pairs.size() == before) return true;
-        std::vector<uint32_t> counts;   // the lookup counts the loaned copies' hits start from
-        if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(counts)) {
-            m_.wedge();
-            basalt::log::error("basalt inkling2", "the prompt loan lookup baseline could not be read; restart the engine");
-            return false;
+        // Every session takes the baseline: the loan is model-level, and a copy the other conversation uses must be
+        // measured in THAT conversation's tally too, or its hits are credited to nobody and it looks cold to feed_heat.
+        for (Session* s : sh_->heat_sessions) {
+            std::vector<uint32_t> counts;   // the lookup counts the loaned copies' hits start from
+            if (cudaStreamSynchronize(s->stream_) != cudaSuccess || !s->read_tally(counts)) {
+                m_.wedge();
+                basalt::log::error("basalt inkling2", "the prompt loan lookup baseline could not be read; restart the engine");
+                return false;
+            }
+            s->loan_start_.resize(counts.size());
+            for (size_t i = before; i < pairs.size(); ++i) s->loan_start_[pairs[i]] = counts[pairs[i]];
         }
-        loan_start_.resize(counts.size());
-        for (size_t i = before; i < pairs.size(); ++i) loan_start_[pairs[i]] = counts[pairs[i]];
         return true;
     }
     // `at`: the prompt's position (-1: a sleep)
@@ -965,21 +969,24 @@ public:
     bool recall_loan(int64_t at) {
         if (m_.wedged()) return false;
         if (m_.loaned() > 0) {
+            // each session banks the hits IT saw on the loaned copies, from its own tally
+            for (Session* s : sh_->heat_sessions) {
             std::vector<uint32_t> t;
-            if (cudaStreamSynchronize(stream_) != cudaSuccess || !read_tally(t)) {
+            if (cudaStreamSynchronize(s->stream_) != cudaSuccess || !s->read_tally(t)) {
                 m_.wedge();
                 basalt::log::error("basalt inkling2", "the prompt loan lookup counters could not be read; restart the engine");
                 return false;
             }
-            loan_hits_.resize(t.size());
+            s->loan_hits_.resize(t.size());
             // The baseline is per session and only the session that published has one; with two sessions the other one
             // recalls (a prompt's prepare, or the sleep). Reading an empty baseline indexed any pair was a null + 4*pair
             // read - the two-session crash at 0x16E0/0x1708 (pairs 1464/1474, a looped core layer's hottest RAM
             // experts, first in the rank-ordered loan list). A session with no baseline simply skips its accounting;
             // the publisher sets a fresh one at its next publish.
-            if (loan_start_.size() == t.size())
-                for (size_t pair : m_.loaned_pairs()) loan_hits_[pair] += t[pair] - loan_start_[pair];
-            loan_start_.clear();
+            if (s->loan_start_.size() == t.size())
+                for (size_t pair : m_.loaned_pairs()) s->loan_hits_[pair] += t[pair] - s->loan_start_[pair];
+            s->loan_start_.clear();
+            }
         }
         return m_.recall_loan(stream_, at < 0 ? std::string("prompt loan recall at sleep") : "prompt loan recall at " + std::to_string(at));
     }
