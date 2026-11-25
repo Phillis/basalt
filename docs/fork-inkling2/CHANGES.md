@@ -4560,3 +4560,24 @@ configuration live now, with **better quality**. It loses only at 30k (41.0 agai
 Also measured and kept at their defaults: `--spec` 0/2/4/8 are inside the noise band (35.8-40.8 at 30k, 48.5-50.7 at 64k);
 `--vram-reserve-mib` 256 is the floor the plan accepts. Profile saved as `basalt_config-2x128k-fp8-merged.json`.
 Needles pass 3/3 at 120,000 on the recommended configuration.
+
+## Session 68 - the batch path's placement pump ported (our Item 2, still missing upstream)
+
+`decode_kept` on this base only folded heat, so a batched round never rebalanced, never published a pending expert loan and
+never submitted the next one - the same defect our own tree fixed in Item 2 ("with two sessions both decode through here
+and the loan stayed off after the first recall"). Ported `Session::pump_placement(pos)` and the per-session call in
+`decode_kept`.
+
+Measured at 2 x 128k, `kv fp8`, first run discarded (the first curve after a start is 10-30% slow - a trap worth
+remembering):
+
+| depth | pump off (warm, 2 runs) | pump on (warm, 2 runs) |
+|---|---|---|
+| 30k | 56.5 / 51.6 | 54.6 / 56.9 |
+| 64k | 52.9 / 50.9 | **54.2 / 56.1** |
+| 96k | 52.2 / 51.0 | 51.6 / 51.8 |
+| 120k | 51.8 / 47.5 | 52.2 / 49.9 |
+
+Median gain ~+2-6% decode (64k: 52 -> 55), inside-to-edge-of the noise band, and it restores the loan cycling the batch
+path skipped - kept for that reason as much as for the speed. Prefill is unchanged (1,619 / 1,543 with the pump against
+1,614 / 1,539 without).

@@ -478,6 +478,9 @@ public:
         for (int i = 0; i < n; ++i) {
             Session& s = *static_cast<Session*>(sessions[i]);
             if (s.win_rows_ > 0) s.fold_rows(std::clamp(kept[i] - s.win_off_, 0, s.win_rows_));
+            // the placement the next round may need: with two sessions both decode through the batch path, and it never
+            // went through decode_window(), so the loan and the rebalances stayed off after the first recall
+            if (!s.pump_placement(s.win_pos_ + s.win_off_ + s.win_rows_)) return wedged();
             for (const BatchSeg& b : batch_segs_)   // a batch's: on this session, its leader
                 if (b.s == &s) fold_rows(std::clamp(kept[i], 0, b.rows), nullptr, b.row0);
         }
@@ -964,6 +967,18 @@ public:
         const int n = m_.rebalance(kRebalanceSwaps);   // paid copies only; the loan stays
         if (n > 0 || m_.wedged()) m_.log_copy_change(("rebalance at " + std::to_string(at) + " (" + std::to_string(n) + " swaps)").c_str(), before, 0, true);
     }
+    // The placement changes due at `pos`, exactly as decode_window() does per window: the batch path never goes through it,
+    // so without a pump nothing rebalances and the loan is never published between rounds (on our tree the same bug kept
+    // the hit rate at 82.8% where the pump took it to 91-96%).
+    bool pump_placement(int64_t pos) {
+        if (!heat_tally_) return true;
+        if (rebalances() && next_rebalance_ >= 0 && pos >= next_rebalance_) rebalance_copies(pos, false);
+        if (m_.wedged()) return false;
+        if (m_.loan_pending() && m_.loan_publish_at() >= 0 && pos >= m_.loan_publish_at() && !publish_loan(pos)) return false;
+        if (m_.wedged()) return false;
+        return m_.submit_loan(pos + kLoanLagRows);
+    }
+
     bool publish_loan(int64_t at) { return settle_hits() && m_.publish_loan(stream_, at); }
     // `at`: the prompt's position (-1: a sleep)
     bool recall_loan(int64_t at) {
