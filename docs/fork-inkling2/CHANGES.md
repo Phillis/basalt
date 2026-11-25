@@ -4198,3 +4198,21 @@ loaders still speak fp16/fp8/int8, and the format is now selectable.
   addresses), plain constexpr in host-only translation units.
 
 Build green. No gate yet: the readers (Item 3) are still fp16/fp8/int8, so nothing may be run with `--kv nvfp4`.
+
+## Session 67 - NVFP4 K/V, Item 3 (part 1): the split kernel speaks NVFP4
+
+- `kv4.cuh`: `k4_piece_scales` - the eight scale bytes of a row whose scales piece is already in registers.
+- `attn.cu` `attn_split_kernel<FP8, INT8, SkipDeep, F4>`: `kRowBytes` = 80 and `kLoads` = 5 (four code pieces, the fifth
+  the scales) with `kCodeLoads` = 4; `kVRegs` holds the pieces so the value plane can be expanded; the fp16 arm's
+  cp.async never runs for F4 (it must decode first); the key dot decodes 32 values a piece against two scale bytes
+  (`k4_unpack32` + `k4_piece_scales`) and multiplies them onto the same shared-memory queries; the value plane expands
+  into the very same fp16 pairs `sm.v[w][lane]` that the fp8 and int8 arms write, so the softmax and the accumulate after
+  it are the fp16 path's, unchanged.
+- `attn_fused_kernel<FP8, INT8, ROWS, F4>`: the same constants and the same key dot arm (its loader already reaches the
+  F4 pieces through the non-cp.async arm).
+
+**Not yet**: the fused kernel's value-math arm and its inline store, its window-row reload, `attn_prompt.cu` (its raw
+loader and dispatch), and both dispatches (`attn_split_kernel<false,false,false,true>` and
+`attn_fused_kernel<false,false,N,true>`, plus `use_mma = !a.int8 && !a.f4`). **`nvfp4` is therefore still refused by the
+adapter** - a format the dispatch would send to the fp16 kernels reads four-bit rows at twice their size, which is the
+silent-corruption class this spec exists to avoid.

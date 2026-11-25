@@ -86,6 +86,15 @@ __device__ __forceinline__ void store_v4nv(void* row, int lane, const float (&v)
     k4_store_codes(row, lane, v, k4_scales(v, lane));
 }
 
+/// The eight scale bytes of a row whose scales piece is already in registers (a loader reads bytes 64..79 as one uint4).
+__device__ __forceinline__ void k4_piece_scales(const uint4 u, uint32_t (&s)[kKvF4Groups]) {
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) s[4 * i + j] = (w[i] >> (8 * j)) & 0xFFu;
+}
+
 /// A row's eight scale bytes as numbers the loader can use without decoding them twice.
 __device__ __forceinline__ void k4_row_scales(const uint8_t* row, uint32_t (&s)[kKvF4Groups]) {
     const uint32_t* w = reinterpret_cast<const uint32_t*>(row + kKvF4CodeBytes);

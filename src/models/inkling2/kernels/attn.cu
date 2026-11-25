@@ -13,6 +13,7 @@
 #include "basalt/models/inkling2/kernels.hpp"
 #include "attn_mma.cuh"
 #include "prep.cuh"
+#include "basalt/models/inkling2/kernels/kv4.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
@@ -168,7 +169,7 @@ __device__ __forceinline__ uint4 fp8x8_to_f16x8(uint2 u) {
     return *reinterpret_cast<const uint4*>(h);
 }
 
-template <bool FP8, bool INT8, bool SkipDeep = false>
+template <bool FP8, bool INT8, bool SkipDeep = false, bool F4 = false>
 __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
                                                                  float* __restrict__ part_acc) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -185,15 +186,16 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
     const int span = span_of(n);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
-    constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
-    constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kRowBytes = F4 ? kKvF4RowBytes : FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
+    constexpr int kLoads = F4 ? kKvF4RowBytes / 16 : (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kCodeLoads = F4 ? kKvF4CodeBytes / 16 : kLoads;   // F4: four code pieces, the fifth the scales
     const bk::WindowSegs& at = seg_table(a.seg);
     const SegCaches& sc = a.seg.c[bk::seg_of(at, r)];   // a batch window's row: its conversation's caches
     const uint8_t* kbase = static_cast<const uint8_t*>(at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
     const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
     uint32_t* vrow = sm.v[w][lane];
-    constexpr int kVRegs = (FP8 || INT8) ? kLoads : 1;
+    constexpr int kVRegs = (F4 || FP8 || INT8) ? kLoads : 1;
     const auto load_k_and_v = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kVRegs], float (&ks)[2], float (&vs)[2]) {
         const int key = t0 + lane;
         const bool valid = key < s_hi;
@@ -204,7 +206,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
         if (valid) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
-            if constexpr (!FP8 && !INT8) {
+            if constexpr (!FP8 && !INT8 && !F4) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vp + i, true);
                 asm volatile("cp.async.commit_group;" ::: "memory");
@@ -219,7 +221,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
         } else {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = make_uint4(0, 0, 0, 0);
-            if constexpr (!FP8 && !INT8) {
+            if constexpr (!FP8 && !INT8 && !F4) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) attn_cp16(vrow + 4 * i, vbase, false);
                 asm volatile("cp.async.commit_group;" ::: "memory");
@@ -252,6 +254,24 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
         const bool valid = key < s_hi;
         if (t0 != t_first) load_k_and_v(t0, kr, vr, ks, vs);
         float sc[kGroup] = {0.f, 0.f, 0.f};
+        if constexpr (F4) {
+            uint32_t sk[kKvF4Groups];
+            k4_piece_scales(kr[kCodeLoads], sk);
+#pragma unroll
+            for (int i = 0; i < kCodeLoads; ++i) {
+                uint32_t h[16];
+                k4_unpack32(kr[i], sk[2 * i], sk[2 * i + 1], h);
+#pragma unroll
+                for (int d = 0; d < 16; ++d) {
+                    const float2 fv = __half22float2(*reinterpret_cast<const __half2*>(&h[d]));
+#pragma unroll
+                    for (int hh = 0; hh < kGroup; ++hh) {
+                        sc[hh] = fmaf(sm.q[hh][32 * i + 2 * d], fv.x, sc[hh]);
+                        sc[hh] = fmaf(sm.q[hh][32 * i + 2 * d + 1], fv.y, sc[hh]);
+                    }
+                }
+            }
+        } else {
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
             if constexpr (FP8 || INT8) {
@@ -271,6 +291,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
                     for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][8 * i + d], f[d], sc[h]);
             }
         }
+        }
         const int dist = p - key;
         const bool has_rel = valid && dist < kExtent;
         float b_acc[kGroup] = {0.f, 0.f, 0.f};
@@ -284,8 +305,18 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
         }
 #pragma unroll
         for (int h = 0; h < kGroup; ++h) sc[h] = valid ? sc[h] * a.scale + b_acc[h] : -INFINITY;
-        // INT8 and FP8 convert V into sm.v[w][lane]; FP16 V is already streaming via cp.async
-        if constexpr (INT8) {
+        // INT8, FP8 and NVFP4 convert V into sm.v[w][lane]; FP16 V is already streaming via cp.async
+        if constexpr (F4) {
+            uint32_t sv[kKvF4Groups];
+            k4_piece_scales(vr[kCodeLoads], sv);
+#pragma unroll
+            for (int i = 0; i < kCodeLoads; ++i) {
+                uint32_t h[16];
+                k4_unpack32(vr[i], sv[2 * i], sv[2 * i + 1], h);
+#pragma unroll
+                for (int d = 0; d < 16; ++d) vrow[16 * i + d] = h[d];
+            }
+        } else if constexpr (INT8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
                 uint32_t h[8];
@@ -320,7 +351,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
             for (int u = 0; u < 4; ++u) acc[h][u] *= corr;
             m[h] = mn;
         }
-        if constexpr (!FP8 && !INT8) asm volatile("cp.async.wait_group 0;" ::: "memory");
+        if constexpr (!FP8 && !INT8 && !F4) asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncwarp();
         for (int j = 0; j < kTile; ++j) {
             const uint2 u = *reinterpret_cast<const uint2*>(&sm.v[w][j][lane * 2]);
@@ -1116,7 +1147,7 @@ struct FusedSmem {
     float pacc[kGroup][kHeadDim];
 };
 
-template <bool FP8, bool INT8, int ROWS>
+template <bool FP8, bool INT8, int ROWS, bool F4 = false>
 __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -1124,8 +1155,9 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     Smem& sm = fs.s;
     const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
-    constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kRowBytes = F4 ? kKvF4RowBytes : FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
+    constexpr int kLoads = F4 ? kKvF4RowBytes / 16 : (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kCodeLoads = F4 ? kKvF4CodeBytes / 16 : kLoads;   // F4: four code pieces, the fifth the scales
     // before the wait: the positions (staged before the window), the slice, the warp's tile and what of it is older than
     // the window, and the weights
     int p, lo, n;
@@ -1139,7 +1171,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
     const bool cap_pow2 = a.cap > 0 && (a.cap & (a.cap - 1)) == 0;
-    constexpr int kVRegs = (FP8 || INT8) ? kLoads : 1;
+    constexpr int kVRegs = (F4 || FP8 || INT8) ? kLoads : 1;
     uint4 kr[kLoads];
     uint4 vr[kVRegs];
     float ks[2] = {1.f, 1.f}, vs[2] = {1.f, 1.f};
@@ -1150,7 +1182,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
         const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) kr[i] = __ldg(kp + i);
-        if constexpr (!FP8 && !INT8) {
+        if constexpr (!FP8 && !INT8 && !F4) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vp + i, true);
             asm volatile("cp.async.commit_group;" ::: "memory");
@@ -1165,7 +1197,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     } else {
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) kr[i] = make_uint4(0, 0, 0, 0);
-        if constexpr (!FP8 && !INT8) {
+        if constexpr (!FP8 && !INT8 && !F4) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) attn_cp16(sm.v[w][lane] + 4 * i, vbase, false);
             asm volatile("cp.async.commit_group;" ::: "memory");
@@ -1224,13 +1256,13 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // started at the wait they put those reads in front of the preparation's (2-3x its time in the window)
     bk::pdl_launch_dependents();
     if (active) {
-        if constexpr (!FP8 && !INT8) asm volatile("cp.async.wait_group 0;" ::: "memory");
+        if constexpr (!FP8 && !INT8 && !F4) asm volatile("cp.async.wait_group 0;" ::: "memory");
         if (valid && key >= p0) {   // a row of this window, as prepared above
             const uint4* kp = reinterpret_cast<const uint4*>(fs.kw[key - p0]);
             const uint4* vp = reinterpret_cast<const uint4*>(fs.vw[key - p0]);
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
-            if constexpr (!FP8 && !INT8) {
+            if constexpr (!FP8 && !INT8 && !F4) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(sm.v[w][lane] + 4 * i) = vp[i];
             } else {
