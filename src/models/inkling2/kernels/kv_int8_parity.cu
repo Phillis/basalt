@@ -95,7 +95,7 @@ static bool bench_attention() {
             if (!f.int8 && depth != 0 && depth != 8192 && depth != 65536 && depth != 131072 && depth != 262144) continue;
             const bool window = depth == 0;
             const int64_t cap = window ? ink::kExtent + ink::kDecodeRows : depth;
-            const size_t row_bytes = (size_t) ink::kv_cache_row_bytes(f.fp8, f.int8), cache = (size_t) cap * ink::kKvHeads * row_bytes;
+            const size_t row_bytes = (size_t) ink::kv_cache_row_bytes(f.fp8, f.int8, false), cache = (size_t) cap * ink::kKvHeads * row_bytes;
             uint8_t *kc = nullptr, *vc = nullptr;
             if (!ok || !check_cuda(cudaMalloc(&kc, cache), "k cache") || !check_cuda(cudaMalloc(&vc, cache), "v cache")) {
                 ok = false;

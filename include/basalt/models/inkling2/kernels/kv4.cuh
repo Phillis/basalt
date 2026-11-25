@@ -13,11 +13,13 @@
 // basalt/kernels/kv_fp4.cuh, whose helpers this file reuses so both stacks round identically.  Device inlines only.
 #pragma once
 
-#include <cuda_fp16.h>
-
 #include <cstdint>
 
+#if defined(__CUDACC__)
+#include <cuda_fp16.h>
+
 #include <basalt/kernels/kv_fp4.cuh>
+#endif
 
 namespace basalt::models::inkling2 {
 
@@ -27,6 +29,7 @@ constexpr int kKvF4Groups = 8;                       ///< scale bytes a row
 constexpr int kKvF4Pairs = 4;                        ///< lanes a group spans (four values a lane)
 constexpr float kKvF4InvSqrt128 = 0.08838834764831845f;   // 1/sqrt(128)
 
+#if defined(__CUDACC__)
 /// The normalized 128-point Hadamard transform of one row, held by one warp: four values a lane, index 4*lane + j.
 /// Two stages inside the lane (h = 1, 2) and five across the lanes (h = 4, 8, 16, 32, 64 as shfl masks 1, 2, 4, 8, 16).
 /// Orthonormal and its own inverse.  Every lane of the warp must call it.
@@ -123,5 +126,11 @@ __device__ __forceinline__ void k4_unpack16(const uint2 u, uint32_t s, uint32_t 
     h[0] = a.x; h[1] = a.y; h[2] = a.z; h[3] = a.w;
     h[4] = b.x; h[5] = b.y; h[6] = b.z; h[7] = b.w;
 }
+
+#endif  // __CUDACC__
+
+/// Parity entry point (kernels_parity's test): one warp a row, four values a lane, in -> H(in).  Defined in ops.cu, so a
+/// host-only translation unit can call it without a kernel launch.
+void kv4_hadamard128_test(const float* in, float* out, int rows, void* stream);
 
 }  // namespace basalt::models::inkling2

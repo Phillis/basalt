@@ -4267,3 +4267,56 @@ cache must give the unrotated fp32 pair's scores. Suspects, in the order the par
 order in `k4_store_codes` against `kv4_decode8`'s (value 2i in the low nibble), `k4_scales`' two-lane group reduction,
 `k4_unpack32`'s group-to-scale mapping (u.x,u.y = group 2i, u.z,u.w = group 2i+1), and whether every key-writing site
 really turns its row while every query site turns the query once.
+
+## Session 67 - CORRECTION: the earlier "garbage output / engine dies" evidence was instrument error
+
+Recording this because the previous entry (`nvfp4-kv` `3cf659fe`) asserted more than the measurements support.
+
+1. **"`!!!!!!` at a 5k needle" is not established as a format defect.** The needle harness posts a concurrent decoy
+   request and prints its answer on some paths; that line may be the decoy's. The `!!!!` line was never tied to the
+   needle request.
+2. **"The engine ends at 30k/64k" was the multi-server artefact.** Four stale `serve.server` processes from earlier
+   starts were fighting for port 8080 and starving RAM ("RAM ran out loading (640 MiB free)"); the engine being killed
+   and restarted by its lifeline shows up as HTTP 503 at every depth. The clean single-server run then produced a
+   *different* failure: HTTP 500 with `inkling2: the pick failed`.
+3. **`the pick failed` is a session-level refusal, not a CUDA fault**: `src/models/inkling2/session.cpp` raises it (two
+   sites) when it cannot pick a conversation's cache/checkpoint. It arrives with `tg=0`, i.e. before any generation, and
+   the engine stays alive.
+4. **My direct-probe script is itself invalid**: it gets HTTP 400 Bad Request for its *first* (28-token) request on the
+   current `pr650-int` build as well as on the nvfp4 build, so it cannot be used to judge any format. The known-good
+   interface is the one Gate 0 uses (the OpenAI-compatible endpoint via `Invoke-RestMethod`), which on nvfp4 answered
+   391, Tokyo and the planets correctly, twice.
+
+So: nvfp4's short-context path is **correct as far as anything valid has shown**, and its long-prompt behaviour is a
+*refusal* (`the pick failed`) rather than the corruption the previous entry implied. Nothing here proves the codec is
+sound either - parity has still not been run, and that is gate 1.
+
+Next session, in this order:
+1. Rebuild `nvfp4-kv` (`git checkout nvfp4-kv`, build, save `bin/arm-nvfp4.exe`) and start it from *zero* processes with
+   >24 GiB free and exactly one `serve.server`.
+2. Long-prompt test through the **server API** (not the probe), then `needles3.py 64000` on that clean start.
+3. If the 64k needle passes, run parity (`kv_f4_parity` + f4 cases) and the numerics gate: nvfp4 must reach KLD <= 0.00699
+   (fp8 + 0.0010) and top-1 within 0.15 points of fp8.
+4. If `the pick failed` persists, read `session.cpp`'s two sites: the pick is the conversation cache a prompt resumes into,
+   so a 26k prompt with `parallel 2` may be asking for a checkpoint the cache cannot supply under nvfp4's smaller cells.
+
+## Session 68 - NVFP4: the Hadamard test, and it fails on the current code (`nvfp4-kv`)
+
+The review session's spec (`SPEC-NVFP4-DEFECTS-AND-SILENT-EXIT.md`) named a confirmed defect in
+`kv4_hadamard128`'s in-lane stage: the butterfly reads `v[j ^ h]` after it has already been overwritten, so it keeps only
+half of the lane's dimensions and the 128-point map has rank 64. This entry records the test that proves it, run
+**before** the fix, as the spec requires.
+
+The test lives in `kernels_parity.cpp` (`test_kv4_hadamard`, called from main) with its device side in
+`kv4_hadamard128_test` (`ops.cu`), so the values are the kernel's own. Four checks: against the Walsh-Hadamard matrix
+built from the definition `(-1)^popcount(i & j) / sqrt(128)`; `H(H(v)) == 128 v`; a dot product kept `x128`; a norm kept
+`x sqrt(128)`.
+
+    kv4_hadamard128 == the Walsh-Hadamard matrix worst 2.507e+00 (tol 1e-04) FAIL
+    kv4_hadamard128 H(H(v)) == 128 v             worst 1.308e+00 (tol 1e-03) FAIL
+    kv4_hadamard128 dot kept (x128)              worst 1.006e+00 (tol 1e-03) FAIL
+    kv4_hadamard128 norm kept (x sqrt 128)       worst 9.957e-01 (tol 1e-03) FAIL
+    inkling2_kernels_parity: 4 failures
+
+`kv4.cuh` is also host-safe now: the device half sits behind `#if defined(__CUDACC__)` (a .cpp includes it for the
+constants and the entry point), and the parity harnesses' `kv_cache_row_bytes` calls take the F4 flag.

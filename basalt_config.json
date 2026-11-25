@@ -6,7 +6,7 @@
             "model": "C:/LLM/Basalt/models/Inkling-2-Mini-NVFP4.basalt",
             "gpu": "0",
             "max-context": 262144,
-            "kv": "fp8",
+            "kv": "nvfp4",
             "parallel": 2,
             "vision": "off",
             "vram-reserve-mib": 256,

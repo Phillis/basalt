@@ -11,6 +11,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/kernels/kv4.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -126,7 +127,7 @@ double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 // The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8).
 enum Kv { kF16, kE4M3, kI8 };
 const Kv kAllKv[] = {kF16, kE4M3, kI8};
-size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
+size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8, false); }
 const char* kv_tag(Kv kv) { return kv == kE4M3 ? ", E4M3" : kv == kI8 ? ", INT8" : ""; }
 void kv_set(Kv kv, AttnPrep& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
 void kv_set(Kv kv, AttnArgs& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
@@ -2057,6 +2058,69 @@ void test_attention_window_boundary() {
 
 }  // namespace
 
+// ---- NVFP4's 128-point transform (kernels/kv4.cuh) ------------------------------------------------------------------
+// One warp holds one row: four values a lane, dimension 4*lane + j.  The transform is orthonormal, so H(H(v)) = 128 v, a dot
+// product is kept up to the factor 128 and a norm up to sqrt(128); and it must equal the Walsh-Hadamard matrix itself, so
+// the reference is built from the definition (-1)^popcount(i & j) / sqrt(128).  A butterfly that overwrites a value it still
+// has to read keeps only half the dimensions, which every one of these four checks rejects.
+
+void test_kv4_hadamard() {
+    constexpr int kRows = 2;
+    const size_t n = (size_t) kRows * kHeadDim;
+    std::vector<float> in = randn(n), h1(n), h2(n);
+    float* d_in = nullptr;
+    float* d_out = nullptr;
+    cudaMalloc(&d_in, n * sizeof(float));
+    cudaMalloc(&d_out, n * sizeof(float));
+    cudaMemcpy(d_in, in.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    kv4_hadamard128_test(d_in, d_out, kRows, nullptr);
+    cudaMemcpy(h1.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(d_in, h1.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    kv4_hadamard128_test(d_in, d_out, kRows, nullptr);
+    cudaMemcpy(h2.data(), d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // the reference matrix, from the definition
+    std::vector<double> hm((size_t) kHeadDim * kHeadDim);
+    for (int i = 0; i < kHeadDim; ++i)
+        for (int j = 0; j < kHeadDim; ++j) {
+            int s = 0;
+            for (int b = 0; b < 7; ++b) s ^= ((i >> b) & 1) & ((j >> b) & 1);
+            hm[(size_t) i * kHeadDim + j] = (s ? -1.0 : 1.0) / std::sqrt((double) kHeadDim);
+        }
+
+    double worst_ref = 0.0, worst_sq = 0.0, worst_dot = 0.0, worst_norm = 0.0;
+    for (int r = 0; r < kRows; ++r) {
+        for (int i = 0; i < kHeadDim; ++i) {
+            double want = 0.0;
+            for (int j = 0; j < kHeadDim; ++j) want += hm[(size_t) i * kHeadDim + j] * in[(size_t) r * kHeadDim + j];
+            worst_ref = std::max(worst_ref, std::fabs(want - h1[(size_t) r * kHeadDim + i]));
+            const double back = h2[(size_t) r * kHeadDim + i] - (double) kHeadDim * in[(size_t) r * kHeadDim + i];
+            worst_sq = std::max(worst_sq, std::fabs(back) / std::max(1.0, std::fabs((double) kHeadDim * in[(size_t) r * kHeadDim + i])));
+        }
+    }
+    {
+        double qk = 0.0, hqhk = 0.0, nq = 0.0, nh = 0.0;
+        for (int d = 0; d < kHeadDim; ++d) {
+            qk += (double) in[d] * in[kHeadDim + d];
+            hqhk += (double) h1[d] * h1[kHeadDim + d];
+            nq += (double) in[d] * in[d];
+            nh += (double) h1[d] * h1[d];
+        }
+        worst_dot = std::fabs(hqhk - (double) kHeadDim * qk) / std::max(1.0, std::fabs((double) kHeadDim * qk));
+        worst_norm = std::fabs(nh - (double) kHeadDim * nq) / std::max(1.0, (double) kHeadDim * nq);
+    }
+    cudaFree(d_in);
+    cudaFree(d_out);
+    const auto say = [&](const char* what, double v, double tol) {
+        if (v > tol) ++failures;
+        std::printf("  kv4_hadamard128 %-28s worst %.3e (tol %.0e) %s\n", what, v, tol, v > tol ? "FAIL" : "ok");
+    };
+    say("== the Walsh-Hadamard matrix", worst_ref, 1e-4);
+    say("H(H(v)) == 128 v", worst_sq, 1e-3);
+    say("dot kept (x128)", worst_dot, 1e-3);
+    say("norm kept (x sqrt 128)", worst_norm, 1e-3);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -2084,6 +2148,7 @@ int main() {
     test_heat_fold();
     test_batch_window();
     test_attention_window_boundary();
+    test_kv4_hadamard();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

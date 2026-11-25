@@ -884,3 +884,24 @@ void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream) {
 }
 
 }  // namespace basalt::models::inkling2
+
+// ---- the 128-point transform's parity entry point ---------------------------------------------------------------------
+namespace basalt::models::inkling2 {
+namespace {
+__global__ void kv4_hadamard128_test_kernel(const float* __restrict__ in, float* __restrict__ out) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = in[(size_t) row * kHeadDim + lane * 4 + j];
+    kv4_hadamard128(v, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) out[(size_t) row * kHeadDim + lane * 4 + j] = v[j];
+}
+}  // namespace
+
+void kv4_hadamard128_test(const float* in, float* out, int rows, void* stream) {
+    if (rows <= 0) return;
+    kv4_hadamard128_test_kernel<<<rows, 32, 0, (cudaStream_t) stream>>>(in, out);
+}
+
+}  // namespace basalt::models::inkling2

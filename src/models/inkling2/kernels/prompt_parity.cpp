@@ -119,7 +119,7 @@ double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
 // The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8).
 enum Kv { kF16, kE4M3, kI8 };
-size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
+size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8, false); }
 const char* kv_name(Kv kv) { return kv == kE4M3 ? "e4m3" : kv == kI8 ? "int8" : "fp16"; }
 // One head row of kHeadDim values `x` written in format kv to `row` (kv_bytes(kv) bytes); `got` takes the values the row
 // holds. INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even.
