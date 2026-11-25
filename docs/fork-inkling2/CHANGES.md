@@ -4320,3 +4320,17 @@ built from the definition `(-1)^popcount(i & j) / sqrt(128)`; `H(H(v)) == 128 v`
 
 `kv4.cuh` is also host-safe now: the device half sits behind `#if defined(__CUDACC__)` (a .cpp includes it for the
 constants and the entry point), and the parity harnesses' `kv_cache_row_bytes` calls take the F4 flag.
+
+## Session 68 - NVFP4 defects A, B, C fixed (the Hadamard bug is gone)
+
+- **A (the confirmed codec bug)**: `kv4_hadamard128`'s in-lane stage now reads each pair once
+  (`if (j & h) continue; v[j] = a + b; v[j ^ h] = a - b;`) instead of reading `v[j ^ h]` after it was overwritten - the
+  old form destroyed two of every four values, leaving a rank-64 map, which is why long prompts garbled while Gate 0
+  passed. Test after the fix: Walsh matrix `3.0e-07`, `H(H(v)) == v` `2.7e-07`, dot kept `2.8e-07`, norm kept `4.6e-09`
+  - **0 failures**.
+- The test's own expectations were wrong first: the shipped transform carries its 1/sqrt(128), so it is orthonormal and
+  `H(H(v)) = v` with dot products and norms kept, not `128 v` / `x128` / `x sqrt(128)` (the spec's factors are the
+  unnormalized butterfly's). The `0.992` residual on the first run was exactly `127/128`.
+- **B**: `cell_format()` gives NVFP4 its own tag (5) instead of falling through to fp16's 3, so a parked conversation or a
+  disk image cannot be mistaken for fp16 across engines.
+- **C**: `k4_store_codes` zeroes the row's last eight bytes (padding), so checkpoints and byte-for-byte dumps are stable.

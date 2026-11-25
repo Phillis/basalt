@@ -38,8 +38,10 @@ __device__ __forceinline__ void kv4_hadamard128(float (&v)[4], int lane) {
     for (int h = 1; h < 4; h <<= 1) {   // inside the lane: index bits 0 and 1
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
+            if (j & h) continue;   // each pair once, from the element whose bit is clear
             const float a = v[j], b = v[j ^ h];
-            v[j] = (j & h) ? b - a : a + b;
+            v[j] = a + b;
+            v[j ^ h] = a - b;
         }
     }
 #pragma unroll
@@ -76,6 +78,7 @@ __device__ __forceinline__ void k4_store_codes(void* row, int lane, const float 
         p[lane * 2 + b] = (uint8_t) (lo | (hi << 4));
     }
     if ((lane & (kKvF4Pairs - 1)) == 0) p[kKvF4CodeBytes + lane / kKvF4Pairs] = (uint8_t) scale_byte;
+    if (lane == 0) *reinterpret_cast<uint64_t*>(p + kKvF4CodeBytes + kKvF4Groups) = 0ull;   // bytes 72..79: padding, zeroed
 }
 
 /// A key row: the 128-point transform, then the group scale, then the codes at lane * 2.

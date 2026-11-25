@@ -2094,8 +2094,8 @@ void test_kv4_hadamard() {
             double want = 0.0;
             for (int j = 0; j < kHeadDim; ++j) want += hm[(size_t) i * kHeadDim + j] * in[(size_t) r * kHeadDim + j];
             worst_ref = std::max(worst_ref, std::fabs(want - h1[(size_t) r * kHeadDim + i]));
-            const double back = h2[(size_t) r * kHeadDim + i] - (double) kHeadDim * in[(size_t) r * kHeadDim + i];
-            worst_sq = std::max(worst_sq, std::fabs(back) / std::max(1.0, std::fabs((double) kHeadDim * in[(size_t) r * kHeadDim + i])));
+            const double back = h2[(size_t) r * kHeadDim + i] - in[(size_t) r * kHeadDim + i];
+            worst_sq = std::max(worst_sq, std::fabs(back) / std::max(1.0, std::fabs((double) in[(size_t) r * kHeadDim + i])));
         }
     }
     {
@@ -2106,8 +2106,8 @@ void test_kv4_hadamard() {
             nq += (double) in[d] * in[d];
             nh += (double) h1[d] * h1[d];
         }
-        worst_dot = std::fabs(hqhk - (double) kHeadDim * qk) / std::max(1.0, std::fabs((double) kHeadDim * qk));
-        worst_norm = std::fabs(nh - (double) kHeadDim * nq) / std::max(1.0, (double) kHeadDim * nq);
+        worst_dot = std::fabs(hqhk - qk) / std::max(1.0, std::fabs(qk));
+        worst_norm = std::fabs(nh - nq) / std::max(1.0, nq);
     }
     cudaFree(d_in);
     cudaFree(d_out);
@@ -2116,9 +2116,9 @@ void test_kv4_hadamard() {
         std::printf("  kv4_hadamard128 %-28s worst %.3e (tol %.0e) %s\n", what, v, tol, v > tol ? "FAIL" : "ok");
     };
     say("== the Walsh-Hadamard matrix", worst_ref, 1e-4);
-    say("H(H(v)) == 128 v", worst_sq, 1e-3);
-    say("dot kept (x128)", worst_dot, 1e-3);
-    say("norm kept (x sqrt 128)", worst_norm, 1e-3);
+    say("H(H(v)) == v (orthonormal)", worst_sq, 1e-3);
+    say("dot kept", worst_dot, 1e-3);
+    say("norm kept", worst_norm, 1e-3);
 }
 
 int main() {
