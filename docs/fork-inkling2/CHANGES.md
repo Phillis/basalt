@@ -4334,3 +4334,22 @@ constants and the entry point), and the parity harnesses' `kv_cache_row_bytes` c
 - **B**: `cell_format()` gives NVFP4 its own tag (5) instead of falling through to fp16's 3, so a parked conversation or a
   disk image cannot be mistaken for fp16 across engines.
 - **C**: `k4_store_codes` zeroes the row's last eight bytes (padding), so checkpoints and byte-for-byte dumps are stable.
+
+## Session 68 - NVFP4: the fault is named - `decode_prepare` faults on a 26k prompt
+
+After defects A (Hadamard), B (cell_format) and C (padding) the codec is provably right - the parity test passes 4/4 -
+but a long prompt still fails, and now the site is named rather than inferred:
+
+- `parallel 1`, `prompt-cache 0`, 26,657-token prompt: the engine exits (exit code 1) with
+  `basalt: error: sample_tokens launch: an illegal memory access was encountered` and a
+  `basalt crash: EXCEPTION_ACCESS_VIOLATION (0xC0000005) ... in reading the prompt, from token (0)` record.
+- With **`CUDA_LAUNCH_BLOCKING=1`** the sticky error is resolved to its own launch:
+  **`basalt: error: inkling2 decode_prepare: an illegal memory access was encountered`**. So `prepare_kernel`
+  (`kernels/glue.cu`, the K/V writer) is the faulting kernel; `sample_tokens` only reported it before.
+- 10,657 tokens succeeds; 26,657 fails with `parallel 1, prompt-cache 0`; with `parallel 2, prompt-cache 6` the same
+  depth failed as `the pick failed` (the same sticky error surfacing in `Session::pick`'s `cudaStreamSynchronize`).
+
+Next: read `prepare_kernel`'s F4 arm against the *decode* window's geometry - `store_k4` (warp-wide shuffles inside
+`if (w < 2)`, the row address from `p % a.cap`, and the row size when `a.cap` is a ring's) - and the spec's S-suspects
+in order. The one-line blocking-mode trick (`CUDA_LAUNCH_BLOCKING=1` in the server's environment) names every future
+occurrence at its own `check("...")` site, so D1/D2 are no longer on the critical path.

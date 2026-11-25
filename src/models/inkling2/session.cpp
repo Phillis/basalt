@@ -1065,6 +1065,7 @@ public:
     }
 
     // 3: fp16, 1: E4M3, 4: scaled INT8, 5: E2M1 with an E4M3 scale per 16 values (NVFP4)
+    int cell_format() const { return m_.cache_f4() ? 5 : m_.cache_int8() ? 4 : m_.cache_fp8() ? 1 : 3; }
 
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
