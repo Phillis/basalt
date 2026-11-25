@@ -109,3 +109,33 @@ depending on harness and content, prefill 1,200-1,700 t/s per stream, hit 91-96%
 No item of this spec improved it. The two items most likely to move it, by the spec's own ranking, are Item 2
 (acceptance: prose acceptance at two slots is 34-56% against 62-67% solo with no explanation yet) and Item 1 (the
 round budget, without which Items 3, 4 and 5 are guesses).
+## Item 0 and Item 1 of SPEC-2SLOT-NEXT-LOSSLESS (measured, 29e89f13)
+
+**Item 0, re-baseline after 2A** (prose harness, both slots decoding 400 tokens at once, two processes):
+
+| context per slot | decode per stream | acc | dl | hit |
+|---|---|---|---|---|
+| ~2k | 33.2 / 32.3 | 70 / 30 | 2.3 / 1.8 | 71.1% / 91.1% |
+| ~64k | 44.6 / 41.9 | 55-70 / 63-66 | 2.3 / 2.0-2.4 | 77.1-71.1% / 95.9-92.7% |
+
+Deeper context is *faster* here, which is the copies warming up and acceptance improving with longer content.
+
+**Item 1, the round budget.** `nsys profile --trace=cuda` of one two-slot 400-token decode, then
+`nsys stats --report cuda_gpu_kern_sum`. Share of GPU kernel time, 1,704-1,705 calls of each decode kernel:
+
+| kernel | share | calls | avg | median |
+|---|---|---|---|---|
+| **`moe_cpu_merge_kernel`** - the merge waiting on the CPU pool's experts | **42.5%** | 1,704 | 442 us | 154 us |
+| `native_gu_multi_kernel` - card gate/up | 14.6% | 1,705 | 152 us | 126 us |
+| `native_down_sub8_kernel` - card down | 9.0% | 1,704 | 94 us | 77 us |
+| `native_q8p_mma_kernel` - dense projections | 3.6% | 278 | 231 us | 50 us |
+| `expert_read_ahead_kernel` | 3.3% | 1,705 | 35 us | 23 us |
+| `q8_planes_kernel` - the head / big dense | 3.1% | 49 | 1,111 us | 964 us |
+| `attn_split_kernel` | 2.6% | 1,705 | 27 us | 22 us |
+| `moe_cpu_ring_kernel` + `fold_kernel` | 3.0% | | | |
+| everything else (router, controllers, post-attn, decode mma) | ~8% | | | |
+
+**So the round is dominated by the CPU pool: 42.5% of kernel time is the merge spinning on results the pool has not
+produced yet, against 24% for the card's own expert kernels.** That is the spec's cost model confirmed with numbers,
+and it re-ranks the remaining items: anything that reduces *misses* (Item 5's extra copies, Item 2's wasted rows) attacks
+42.5%; anything that speeds the card experts (Items 3, 4) attacks at most 24%.

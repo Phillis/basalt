@@ -23,3 +23,7 @@ fg.err
 basalt_config.totals.json
 test-v4.totals.json
 
+prof.nsys-rep
+prof.sqlite
+*.nsys-rep
+*.sqlite
