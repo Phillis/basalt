@@ -4353,3 +4353,27 @@ Next: read `prepare_kernel`'s F4 arm against the *decode* window's geometry - `s
 `if (w < 2)`, the row address from `p % a.cap`, and the row size when `a.cap` is a ring's) - and the spec's S-suspects
 in order. The one-line blocking-mode trick (`CUDA_LAUNCH_BLOCKING=1` in the server's environment) names every future
 occurrence at its own `check("...")` site, so D1/D2 are no longer on the critical path.
+
+## Session 68 - NVFP4 ROOT CAUSE FOUND (review session): the decode window never set `.f4`
+
+The review session read `session.cpp` L1262-1348 and found it: the decode window's `AttnPrep ap` and `AttnArgs aa` set
+`fp8` and `int8` but **never `f4`** (0 occurrences in the file), and both default to false. So under `--kv nvfp4` every
+decode window ran the **fp16** arms:
+
+- `prepare_kernel` (glue.cu): `row_bytes = kv_cache_row_bytes(false, false, false)` = **256**, writing a 256-byte fp16 row
+  into a cache allocated at 80-byte rows - hence `EXCEPTION_ACCESS_VIOLATION` at depth (640 B/position allocated against
+  2,048 B/position written, so the first row past the mapped end is at ~11.5k-16k positions: 10,657 alive, 26,657 dead,
+  exactly the observed curve), and silent corruption inside the window rings from ~position 323 of every 1,032-wrap;
+- `use_mma = !int8 && !f4` = true, so `attn_mma_kernel` read those rows as fp16.
+
+That is also why the **fp8v4 port died on this base**: the same missing flag. The prompt path was right only because
+`prompt.cpp` sets all three.
+
+Fixed: `ap.f4 = m_.cache_f4();` (after `ap.int8`) and `aa.f4 = m_.cache_f4();` (after `aa.int8`) in `session.cpp`, and the
+parity harnesses' `kv_set` now states `a.f4 = false` explicitly so those suites cannot silently test fp16.
+
+After the fix the decode runs the F4 arms for the first time, and the failure moves: 25 tokens -> `391` correct, then a
+10,657-token prompt ends the engine with `inkling2 controllers/up: an illegal memory access` (a sticky error surfacing at
+the next launch, i.e. some earlier kernel now faults). Next: `CUDA_LAUNCH_BLOCKING=1` to name it, then the spec's S1
+(the split decode kernel, which NVFP4 is the first format to run at depth in production - fp8/fp16 always take the MMA
+path, int8 from kMmaMinKeys up).

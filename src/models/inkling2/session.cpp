@@ -1316,6 +1316,7 @@ private:
         ap.cap = c.cap;
         ap.fp8 = m_.cache_fp8();
         ap.int8 = m_.cache_int8();
+        ap.f4 = m_.cache_f4();   // [F4] the decode window must not run the fp16 arms on an NVFP4 cache
         ap.q = x.q_;
         ap.r = x.r_;
         ap.sink = x.sink_;
@@ -1331,6 +1332,7 @@ private:
         aa.cap = c.cap;
         aa.fp8 = m_.cache_fp8();
         aa.int8 = m_.cache_int8();
+        aa.f4 = m_.cache_f4();   // [F4]
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         aa.gate = ap.yq + kOffGate;

@@ -129,8 +129,8 @@ enum Kv { kF16, kE4M3, kI8 };
 const Kv kAllKv[] = {kF16, kE4M3, kI8};
 size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8, false); }
 const char* kv_tag(Kv kv) { return kv == kE4M3 ? ", E4M3" : kv == kI8 ? ", INT8" : ""; }
-void kv_set(Kv kv, AttnPrep& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
-void kv_set(Kv kv, AttnArgs& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
+void kv_set(Kv kv, AttnPrep& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; a.f4 = false; }
+void kv_set(Kv kv, AttnArgs& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; a.f4 = false; }
 // One head row of kHeadDim values `x` written in format kv to `row` (kv_bytes(kv) bytes); `got` takes the values the row
 // holds. INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even.
 void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
