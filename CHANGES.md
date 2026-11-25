@@ -67,3 +67,45 @@ accounting, the rejected-draft policy, interleaving), not from tuning.
 started** - the session's context budget was spent on Tier 0 and Tier 1. The spec's order stands, and 2A is the
 one it calls "a sure gain": the loan's heat still counts only the publishing conversation (hit 82.8% with both
 slots decoding against 93% with one), and the fix is the four steps in section 5.2A.
+# SPEC-2SLOT-NEXT-LOSSLESS.md - status of every item
+
+Working tree `pr650-int`, base commit `29e89f13`. Each item below says what was done, what was measured, and
+why it was kept or dropped. The rule held throughout: only a measured gain in decode or prompt processing survives.
+
+| item | status | result |
+|---|---|---|
+| 0 Re-baseline after 2A | **partial** | scenario A post-2A: 29.4 and 42.7 tok/s per stream across two runs, hit 92.7% / 91.1-95.9%; overlap rounds 38.2-39.6 tok/s decoder, reader 1,496-1,629 t/s, 15.1-15.7 s per round. The full 2-harness x 2-context x 2-process matrix was not run. |
+| 1 Round budget (NVTX + nsys) | **not done** | needs NVTX ranges added to the visit and a nsys capture; not started. |
+| 2 Acceptance at two slots | **not done** | Tier 1's `spec` sweep is the hint: `spec 6` measured +11% then -5% across two processes, i.e. the batch policy offers drafts that do not always pay. The four-engine matrix was not run. |
+| 3 Lookahead prefetch with an epoch guard | **implemented, FAILED the gate, reverted** | see below. |
+| 4 Expert GEMV bandwidth | **not done** | gated on Item 1 by the spec itself. |
+| 5 VRAM without a format change | **not attempted** | one constant (`kElasticKeep` 256 MiB at 120k) plus a gate; not reached. |
+| 6 Prefill, lossless | **not done** | half-day decision item; not started. |
+| 7 Reuse across restarts and slots | **not done** | half-day; not started. |
+| 8 Interleaving | **not done** | carry-over from the previous spec; not started. |
+| 9 Gates and the numerics baseline | **partial** | the two missing gates ran green earlier in the session: three needles at 10/50/90% exact at 64,049 and 119,985 tokens with a concurrent decoder, and cancel mid-generation x5 with the other slot decoding (0 crashes). The KLD/PPL numerics baseline against `inkling2-bf16-base.kld` was not run. |
+
+## Item 3, in detail - the one engineering change attempted
+
+Implemented exactly as specified: `const bool guess = rows <= kGuessRows` (the guess now runs with copies present),
+`guess_epoch_ = m_.placement_epoch()` stamped where the guessed ids are produced, and `if (m_.placement_epoch() ==
+guess_epoch_)` guarding the `expert_prefetch` call. Built clean.
+
+It **crashes**. Two engine processes, both dead within a round or two:
+scenario A fell to 14.4 then 18.4 tok/s per stream and then to 0 with HTTP 503s, the stress harness failed rounds
+with the engine gone, and `server.out` carried 5 crash lines. Restoring the previous build returns the machine to
+hit 92.7%, 38.2 tok/s per stream in the overlap rounds and 0 crashes.
+
+So the epoch is **not sufficient**: a recall/demote inside the same epoch number still leaves the guessed
+addresses naming memory that the cache grow or a demote reclaimed, which is why the original author disabled the
+guess outright rather than stamping it. Reverted; the tree is clean at `29e89f13`. Any future attempt needs the
+guard the spec's own note hints at - mask the guess through the kernel's RAM mask at prefetch time, or re-read the
+copy table per guess - and must pass `stress_two_slot.py` 20/20 before it is measured at all.
+
+## What this means
+
+The measured state of the tree is the same as at the start of this spec: two-slot decode 38-46 tok/s per stream
+depending on harness and content, prefill 1,200-1,700 t/s per stream, hit 91-96%, agent turns 0.9-3.7 s at 40k.
+No item of this spec improved it. The two items most likely to move it, by the spec's own ranking, are Item 2
+(acceptance: prose acceptance at two slots is 34-56% against 62-67% solo with no explanation yet) and Item 1 (the
+round budget, without which Items 3, 4 and 5 are guesses).
