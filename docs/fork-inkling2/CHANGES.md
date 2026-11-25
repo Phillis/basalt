@@ -407,7 +407,7 @@ staging`), and the remaining decode bottleneck was re-measured with in-engine in
 ## Load failures: the plan was a knife's edge over the pinned-memory quota
 
 - A fresh-process probe reproduces the engine's whole pinned allocation sequence (drafter rows, 256 MiB read
-  staging, 0.86 GiB mapped embedding, the 13.4 GiB mapped spill region) with no failure — so the machine's
+  staging, 0.86 GiB mapped embedding, the 13.4 GiB mapped spill region) with no failure ï¿½ so the machine's
   CUDA host-allocation quota (~14.6 GiB on this 32 GB WDDM box, not `VirtualLock`, see MEMORY-LOCKING.md) is the
   only wall.
 - The 192k+DSpark plan at `kCardSpare = 1024` spilled 2796 experts (pinned demand ~14.7 GiB: spill 13.56 +
@@ -434,7 +434,7 @@ in the engine's plan phase interacting with the task context (unresolved; open q
 `BASALT_DIAG_VISIT=1` (environment of the engine process) turns on:
 
 - GPU-timeline stamps (`%globaltimer`, one tiny capturable kernel per boundary) around every visit's expert
-  segment — `src/models/inkling2/kernels/ops.cu` `diag_stamp`, wired in `session.cpp`.
+  segment ï¿½ `src/models/inkling2/kernels/ops.cu` `diag_stamp`, wired in `session.cpp`.
 - A host-func execution counter in `cpu_spill.cpp` and the pool's own busy-time counters
   (`CpuSpill::diag_pool`), logged per 25 windows by the session.
 
@@ -735,7 +735,7 @@ greedy path; it is documented as not worth turning on for this use.
 
 ---
 
-# Session 5: clean re-measurement of the W1+W2 build — the drafter tax, the content-dependence, and prefill
+# Session 5: clean re-measurement of the W1+W2 build ï¿½ the drafter tax, the content-dependence, and prefill
 
 After deepseek's Session 4 and the launcher cleanup, the build was re-measured with no concurrent start/stop
 interference (an earlier "decode-to-prefill deadlock" and a "262144 restart" observed mid-session were
@@ -760,11 +760,11 @@ fixed per-window cost no longer pays for its dl ~2. Measured budget per spec-8 w
 pool 15.2, GPU chain 10.2 (nearly flat in rows), head 0.95, host 1.6, and **~9 ms of drafter+engine outside the
 window** (`draft_end` syncs the whole stream; `draft_begin`'s attention is uncaptured).
 
-## Why W4 (relaxed drafting) was never going to help — confirmed
+## Why W4 (relaxed drafting) was never going to help ï¿½ confirmed
 
 The workload is greedy (no marginal drafts to relax), dl is capped by the drafter's ~2-token horizon (not by
-acceptance), and the drafter's fixed cost exceeds the value of a kept draft — which is exactly why deepseek's
-sampled relax runs got *slower* (55.3/44.8 vs 60.8). Also found: **their `suffix-draft 8` test was invalid —
+acceptance), and the drafter's fixed cost exceeds the value of a kept draft ï¿½ which is exactly why deepseek's
+sampled relax runs got *slower* (55.3/44.8 vs 60.8). Also found: **their `suffix-draft 8` test was invalid ï¿½
 inkling2 does not parse `--suffix-draft`**, so the lookup drafter never ran. Spec 3 W-B adds the flag.
 
 ## Prefill on the current build
@@ -786,7 +786,7 @@ reclaim/retake cycle is the prefill regression vs the 1.5-1.8k of the pre-W1 bui
 
 `DECODE-PERF-SPEC-3.md`: W-A cut the drafter block cost (restores spec-8's value, ~64 t/s), W-B enable
 `--suffix-draft` for inkling2 (dl 3-8 on repetitive content), W-C the Q2_0 CPU shadow **in pageable RAM**
-(Session 4's "needs 5.5 GB pinned, past the ceiling" claim was wrong — the shadow is CPU-read-only and needs
+(Session 4's "needs 5.5 GB pinned, past the ceiling" claim was wrong ï¿½ the shadow is CPU-read-only and needs
 no pinning), W-D prefill (standing staging floor, CPU-share re-sweep, 8192 chunks), W-E the tally fix.
 
 ---
@@ -896,10 +896,10 @@ Written alongside DECODE-PERF-SPEC-3 section 6 while another agent works the eng
 
 - **Prefill is PCIe-staging-bound and the staging is serial per visit.** Every one of a chunk's 48 visits
   stages its layer's spilled experts on the *compute stream* before its expert products; the loop layers
-  (6-17) re-stage the same ~515 MiB three times per 4,096-token chunk — ~26.6 GiB per chunk nominally, the
+  (6-17) re-stage the same ~515 MiB three times per 4,096-token chunk ï¿½ ~26.6 GiB per chunk nominally, the
   elastic copies covering part of it D2D. The DMA (1.25-1.7 s/chunk at 15.75 GB/s) issued as ~40-60 ms serial
   stalls per visit reproduces every measured prefill rate.
-- **Fix P1: copy-stream + half-layer ping-pong staging with prefetch** — projected 2,150-2,900 t/s, which
+- **Fix P1: copy-stream + half-layer ping-pong staging with prefetch** ï¿½ projected 2,150-2,900 t/s, which
   clears the 2,000 target. P2: weight the elastic promote ranking by staging frequency (loop-layer copies
   save 3x per chunk). P3: the standing staging floor fixes the 443 t/s first-chunk reclaim tax.
 - **Two Session-4 prefill conclusions were invalid**: the `prefill-cpu-share` sweep was a no-op (inkling2
@@ -4116,7 +4116,7 @@ Ported the v4 value cache into `attn.cu` (split + fused kernels, `V4` template, 
 Three defects caught, all of them silent-corruption class: a mangled address in the prompt loader's slow path; a
 **dispatch that was never templated** (so `fp8v4` launched the fp8 prompt kernel and read 80-byte value rows at the
 key's stride); and upstream's new KV read-ahead prefetching past the end of the value array because it strode both
-planes by the key cell. `use_mma` now excludes v4 (the MMA kernels read 16-byte K/V rows).
+planes by the key cell (hygiene, not the proven cause: our own tree over-reads the same way and does not fault). `use_mma` now excludes v4 (the MMA kernels read 16-byte K/V rows).
 
 Still failing with `kv=fp8v4`, so **not shipped**: long prompts die with a sticky "illegal memory access" surfacing
 at the next expert copy. Two slots: at the 32768 -> 65536 elastic grow. One slot: even earlier, in the first chunk's

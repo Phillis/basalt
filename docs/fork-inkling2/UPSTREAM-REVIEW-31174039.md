@@ -262,6 +262,9 @@ upstream rewrote `attn.cu` (+957) and `attn_prompt.cu` (+480). Five writers and 
    memory access during the first chunk.
 3. **The KV read-ahead** (`mix_norm_kernel`'s prefetcher, upstream's new L2 warm-up) strode *both* planes by `kv_cell`,
    so with 80-byte value rows it prefetched past the end of the value array. It now takes `kv_cell_v`.
+   **Caveat that matters for the next session:** our own tree has the same over-read and passes needles, so a bulk
+   prefetch past a mapped region does not appear to fault on this driver. This fix is correctness hygiene; it is NOT
+   the proven cause of the remaining fault below, and should not be assumed to be.
 
 ### What still fails, precisely
 
