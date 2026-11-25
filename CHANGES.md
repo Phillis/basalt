@@ -139,3 +139,49 @@ Deeper context is *faster* here, which is the copies warming up and acceptance i
 produced yet, against 24% for the card's own expert kernels.** That is the spec's cost model confirmed with numbers,
 and it re-ranks the remaining items: anything that reduces *misses* (Item 5's extra copies, Item 2's wasted rows) attacks
 42.5%; anything that speeds the card experts (Items 3, 4) attacks at most 24%.
+## Items 5, 6 and 7 of SPEC-2SLOT-NEXT-LOSSLESS (after Item 2)
+
+Item 2 (the batch round's cost charged to each slot by rows) is the one that shipped: 2k decode 33.2/32.3 ->
+35.4/36.3 tok/s per stream, 64k 44.6/41.9 -> 44.8/46.5, acceptance up and `dl` down. Everything below was measured
+and did not make the bar, or cannot fit on this card. All three were reverted; the tree keeps Item 2.
+
+### Item 5, `kElasticKeep` 512 -> 256 MiB: measured worse, reverted
+The idea was that 256 MiB of free room left by a cache grow would hold ~120 more copies at depth. Measured:
+~64k decode 44.6 / 41.9 -> **30.2 / 30.3 tok/s per stream** (two processes), ~2k 33.2 / 32.3 -> 50.0 / 47.4. The
+deeper-context arm - the one it was for - regressed by a third, so it is out. (The 2k gain is real but the item was
+aimed at depth, and the spec's own stop rule is "keep it only if decode at 120k improves".)
+
+### Item 6, double-buffered staging: **cannot fit on this card**, reverted
+Item 1's numbers say prefill's staging is exposed (851 ms of copying against 1,540 ms of compute in a 2,545 ms
+8,192-row chunk), so a second staging set was built: alternate spilled layers map a second set of granules, and the
+copies of a layer on the other set no longer wait for the products of the one before (per-layer parity, with the
+`freed` event still recorded so a layer returning to a set waits for everything).
+
+It cannot load: **"`--max-context 131072 needs 2366 MiB a session`"** - the second set doubles the staging the plan
+must reserve, and at two 128k slots the plan has no room. That is the decision Item 6 asked for: the exposed staging
+is real and cannot be hidden on a 12 GB card at 2 x 128k. Loop-aware staging (one staging for a core layer's three
+passes) would need ~6.2 GiB and is further out of reach.
+
+### Item 7.1, the disk conversation cache: writes correctly, **cannot mount at two slots**
+The flags exist and work: `"engine": {"conversation-cache-disk-mib": 4096, "conversation-cache-dir":
+"C:\\LLM\\basalt-conv-cache"}` starts the engine with `disk-cache=4096MiB`, and after a 60k-token turn in each slot
+plus 15 s idle the cache directory holds 34 `.bcs` files of 46-68 MB (they survive a force kill, so the idle write is
+what matters - `Stop-Basalt.cmd` never reaches the at-exit path, as the spec warned).
+
+The restore is refused:
+  conversation cache: read 60017 tokens from disk in 278.2 ms (1.24 GB of state)
+  warning: restoring a parked conversation failed (its running state has another size)
+  warning:   sizes: parked live 98,050,048, this session's running_bytes 113,901,568
+`restore_image()` (session_engine.cpp L635-641) requires the image's `state_a.size()` to equal
+`rt_.session().running_bytes()`, and `running_bytes()` (session.cpp L1037-1041) sums `vc_` - a vector sized **from the
+session's own conversation** (`vc_.assign(max_slot + 1, ...)`). Two sessions of the same model therefore disagree by
+one visit cache's rings (~15.1 MiB), so the guard rejects the image and the prompt is read from the start (29 s for
+60k).
+
+The fix belongs upstream: either the image records its layout and the session's `vc_` is sized from the request's
+caches before the mount, or `running_bytes()` uses a size that does not depend on which conversation the session last
+served. Off by default meanwhile: it writes 1.24 GB per parked conversation for no reuse.
+
+Item 7.2 (a second slot reusing the first slot's system-prompt cells, `slots_share_cells()` is false and
+`copy_from_slot`/`copy_to_slot` are stubs in inkling2) was not attempted - it is the same cell-copy machinery this
+item shows is not reachable at two slots yet.
