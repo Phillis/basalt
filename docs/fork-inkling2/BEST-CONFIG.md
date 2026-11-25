@@ -56,3 +56,13 @@ Gate 0 (391, Tokyo, planets); `needles3.py` 3/3 at 64,000 and 3/3 at 120,000 wit
   to expert copies) and does not help.
 - `--vram-reserve-mib` 256 is the floor the plan accepts; more reserve only takes room from the copies.
 - `kv nvfp4`: see above - correct but dominated.
+
+## Session 68 addendum: the placement pump, and the numbers it settles on
+
+With `Session::pump_placement` called from the batch path (`decode_kept`), warm medians at 2 x 128k, fp8:
+decode 30k ~55.8, 64k ~55.2, 96k ~51.7, 120k ~51.1; prefill 30k 1,634 / 64k 1,540 / 96k 1,378 / 120k 1,280.
+The pump is kept (it also restores the expert-loan cycling the batch path skipped).
+
+Methodology note that matters for every number in this file: **the first `curve2.py` run after an engine start is 10-30%
+slower than the steady state** (30k decode 38.2 against 55-57). Every figure quoted as a comparison here is from the second
+run onward.
