@@ -60,9 +60,9 @@ public:
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
-        // [V4] fp8v4: E4M3 keys with four-bit values (80 bytes a value row instead of 128)
-        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8" && o.kv != "fp8v4") {
-            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8, fp8v4 or int8", o.kv.c_str());
+        // [F4] nvfp4: E2M1 keys and values, an E4M3 scale per 16 values, 80 bytes a row for both planes
+        if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8" && o.kv != "nvfp4") {
+            basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8, int8 or nvfp4", o.kv.c_str());
             return 2;
         }
         dspark_finish_flags(o);   // DSPARK HOOK

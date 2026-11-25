@@ -1,4 +1,13 @@
+# build outputs and local engine artefacts (never committed)
+bin/
+build/
+build-test/
+build-*/
+*.exe
+*.obj
+*.pdb
 server.out
+server.err
 basalt_config.totals.json
 run-pr.cmd
 run-san.cmd

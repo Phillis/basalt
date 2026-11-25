@@ -82,8 +82,8 @@ uint64_t expert_stride(int type, uint64_t blob) {
 
 namespace {
 // The cached keys and values of one visit of layer `layer` for `context` positions (a sliding-window layer: its ring).
-uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8, bool v4) {
-    const uint64_t per_pos = (uint64_t) kKvHeads * kv_pair_bytes(fp8, int8, v4);   // [V4] the value row may be four-bit
+uint64_t visit_cache_bytes(const Geometry& g, int layer, int64_t context, bool fp8, bool int8, bool f4) {
+    const uint64_t per_pos = (uint64_t) kKvHeads * kv_pair_bytes(fp8, int8, f4);   // [F4] equal cells: 160 bytes a position
     return per_pos * (g.swa[(size_t) layer] ? (uint64_t) g.window + kDecodeRows : (uint64_t) context);
 }
 }  // namespace
@@ -197,8 +197,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     }
     cudaGetDevice(&device_);
     ldev_ = device_;
-    fp8_ = req.kv == "fp8" || req.kv == "fp8v4";   // [V4] fp8v4: E4M3 keys
-    v4_ = req.kv == "fp8v4";             // [V4] ... and four-bit values
+    fp8_ = req.kv == "fp8";              // unit-scale E4M3 keys and values
+    f4_ = req.kv == "nvfp4";             // [F4] NVFP4 keys and values, neither of the two above
     const Geometry& g = pack_.geo;
     desc_.arch = "inkling2";
     desc_.n_layers = g.n_layers;
@@ -366,8 +366,8 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     }
     ldev_ = device_;
     cudaSetDevice(device_);
-    fp8_ = req.kv == "fp8" || req.kv == "fp8v4";   // [V4] fp8v4: E4M3 keys
-    v4_ = req.kv == "fp8v4";             // [V4] ... and four-bit values
+    fp8_ = req.kv == "fp8";              // unit-scale E4M3 keys and values
+    f4_ = req.kv == "nvfp4";             // [F4] NVFP4 keys and values, neither of the two above
     int8_ = req.kv == "int8";
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
@@ -402,7 +402,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_, int8_, 0, 0, v4_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+            return session_bytes(g, c, fp8_, int8_, 0, 0, f4_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
@@ -412,7 +412,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 cudaSetDevice(card_device(c));
                 size_t fb = 0, tb = 0;
                 basalt::core::gpu_mem_info(&fb, &tb);
-                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c, v4_) +
+                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c, f4_) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
                                       (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
                 if (need > fb) {
@@ -682,7 +682,7 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
     // card already, so its room is what is free now)
     const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-    const bool fp8 = req.kv == "fp8" || req.kv == "fp8v4", int8 = req.kv == "int8", v4 = req.kv == "fp8v4";   // [V4]
+    const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8", v4 = req.kv == "nvfp4";   // [F4] the third name is NVFP4
     std::vector<int> visits((size_t) g.n_layers, 0);
     for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
     model::SplitSpec s;

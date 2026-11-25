@@ -19,21 +19,15 @@ constexpr int kHeads = 24;          ///< query heads
 constexpr int kKvHeads = 8;         ///< key/value heads
 constexpr int kHeadDim = 128;
 constexpr int kKvInt8RowBytes = (kHeadDim + 4 + 15) & ~15;   ///< INT8 values and two fp16 scales, zero-padded to 16 bytes
-constexpr int kv_cache_row_bytes(bool fp8, bool int8) { return fp8 ? kHeadDim : int8 ? kKvInt8RowBytes : 2 * kHeadDim; }
-
-// [V4] A 4-bit value row: two E2M1-style codes a byte (nibble order: even value low), one fp16 scale per kKvV4Group
-// values, zero-padded to 16 bytes. 80 bytes against fp8's 128, so a K/V cell is 208 bytes instead of 256; the keys stay
-// exactly as they were - only V is compressed (it is averaged, not matched, so its error averages out).
-constexpr int kKvV4Group = 32;                                  ///< values one fp16 scale covers
-constexpr int kKvV4Groups = kHeadDim / kKvV4Group;              ///< scales a row
-constexpr int kKvV4CodeBytes = kHeadDim / 2;                    ///< two 4-bit codes a byte
-constexpr int kKvV4RowBytes = (kKvV4CodeBytes + 2 * kKvV4Groups + 15) & ~15;   ///< codes, scales, pad: 80
-constexpr int kKvV4CodeMin = -8, kKvV4CodeMax = 7;              ///< a four-bit two's complement code
-constexpr float kV4CodeMaxMag = 6.f;                            ///< the largest magnitude an E2M1 code carries
-/// [V4] A value row's bytes for a cache format: the compressed row when v4, else the key's own format.
-constexpr int kv_v_row_bytes(bool fp8, bool int8, bool v4) { return v4 ? kKvV4RowBytes : kv_cache_row_bytes(fp8, int8); }
-/// [V4] What one position costs across K and V.
-constexpr int kv_pair_bytes(bool fp8, bool int8, bool v4) { return kv_cache_row_bytes(fp8, int8) + kv_v_row_bytes(fp8, int8, v4); }
+// NVFP4 (--kv nvfp4): keys and values alike are 80 bytes a row - E2M1 codes with one E4M3 scale byte per 16 values,
+// the keys (and every query read against them) turned by the normalized 128-point Hadamard transform.  See
+// kernels/kv4.cuh for the layout and the codec, and basalt/kernels/kv_fp4.cuh for the rounding the dense stack shares.
+constexpr int kKvF4RowBytes = 80;   ///< a key row and a value row: 64 code bytes, 8 scale bytes, 8 of padding
+constexpr int kv_cache_row_bytes(bool fp8, bool int8, bool f4) {
+    return f4 ? kKvF4RowBytes : fp8 ? kHeadDim : int8 ? kKvInt8RowBytes : 2 * kHeadDim;
+}
+/// What one position costs across K and V (with NVFP4 the two rows are the same size, so the cells are equal).
+constexpr int kv_pair_bytes(bool fp8, bool int8, bool f4) { return 2 * kv_cache_row_bytes(fp8, int8, f4); }
 constexpr int kRel = 16;            ///< relative state per head
 constexpr int kExtent = 1024;       ///< distances the relative bias covers (also the window)
 constexpr int kConv = 4;            ///< short convolution taps
@@ -120,7 +114,7 @@ struct AttnPrep {
     int64_t cap = 0;
     bool fp8 = false;                  ///< unit-scale E4M3 codes (keys are clipped and values normed, so they fit)
     bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
-    bool v4 = false;                   ///< [V4] the value rows are four-bit (keys stay in their own format)
+    bool f4 = false;                   ///< NVFP4 rows: E2M1 codes, an E4M3 scale per 16 values, keys turned 128-point
     float* q = nullptr;                ///< out: the clipped (and scaled) queries [rows][kHeads][kHeadDim]
     float* r = nullptr;                ///< out: the relative states [rows][kHeads][kRel]
     float* sink = nullptr;             ///< out: [rows][kHeads]
@@ -143,7 +137,7 @@ struct AttnArgs {
     int64_t cap = 0;                   ///< the cache's cells (a ring when window is set)
     bool fp8 = false;
     bool int8 = false;
-    bool v4 = false;                   ///< [V4] the value rows are four-bit (keys stay in their own format)
+    bool f4 = false;                   ///< NVFP4 rows (see AttnPrep::f4): the keys are turned, the queries with them
     int window = 0;                    ///< > 0: keys at distance < window only (the cache is then a ring of cap >= window + rows)
     float scale = 0.08838834764831845f;
     const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])

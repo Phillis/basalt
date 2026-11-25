@@ -98,9 +98,8 @@ __global__ void __launch_bounds__(32) sort_scatter_kernel(const int32_t* __restr
 // One 16-byte piece of one position's cell (its key or value rows of every head): x = position, y = (value).
 __global__ void stage_to_ring_kernel(const uint4* __restrict__ k_stage, const uint4* __restrict__ v_stage, int64_t stage_cap,
                                      uint4* __restrict__ k_ring, uint4* __restrict__ v_ring, int64_t ring_cap, int64_t first,
-                                     int pieces, int v_pieces) {
-    // [V4] a value cell may be shorter than a key cell (80 bytes against 128): each plane its own piece count
-    const int n_p = blockIdx.y ? v_pieces : pieces;
+                                     int pieces) {
+    const int n_p = pieces;   // NVFP4 keys and values are the same size, so one piece count serves both
     const int64_t p = first + blockIdx.x;
     const uint4* src = (blockIdx.y ? v_stage : k_stage) + (size_t) (p % stage_cap) * n_p;
     uint4* dst = (blockIdx.y ? v_ring : k_ring) + (size_t) (p % ring_cap) * n_p;
@@ -156,14 +155,14 @@ void remap_ids(int32_t* ids, int n, const int32_t* map, void* stream) {
 }
 
 void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, void* k_ring, void* v_ring, int64_t ring_cap,
-                   int64_t pos0, int rows, int keep, int row_bytes, int v_row_bytes, void* stream) {
+                   int64_t pos0, int rows, int keep, int row_bytes, void* stream) {
     const int64_t end = pos0 + rows, first = end - keep > pos0 ? end - keep : pos0;
     const int n = (int) (end - first);
     if (n <= 0) return;
-    const int pieces = kKvHeads * row_bytes / 16, v_pieces = kKvHeads * v_row_bytes / 16;   // [V4]
+    const int pieces = kKvHeads * row_bytes / 16;
     stage_to_ring_kernel<<<dim3((unsigned) n, 2), 128, 0, (cudaStream_t) stream>>>(
         static_cast<const uint4*>(k_stage), static_cast<const uint4*>(v_stage), stage_cap, static_cast<uint4*>(k_ring),
-        static_cast<uint4*>(v_ring), ring_cap, first, pieces, v_pieces);
+        static_cast<uint4*>(v_ring), ring_cap, first, pieces);
     check("stage_to_ring");
 }
 

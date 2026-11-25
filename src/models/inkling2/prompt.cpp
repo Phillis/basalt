@@ -122,8 +122,8 @@ void carve(Carve& c, Bufs& b, const Geometry& g) {
     b.dst = c.take<int32_t>(P);
     b.exp = c.take<int32_t>(P);
     b.sort_scr = c.take<uint8_t>(moe_sort_scratch((int) P, g.n_expert));
-    const size_t row_bytes = (size_t) std::max(kv_cache_row_bytes(false, false),
-                                               std::max(kv_cache_row_bytes(true, false), kv_cache_row_bytes(false, true)));
+    const size_t row_bytes = (size_t) std::max(std::max(kv_cache_row_bytes(false, false, false), kv_cache_row_bytes(true, false, false)),
+                                               std::max(kv_cache_row_bytes(false, true, false), kv_cache_row_bytes(false, false, true)));
     const size_t stage = (size_t) kKvHeads * R * row_bytes;   // staging must fit the widest cache format
     b.k_stage = c.take<uint8_t>(stage);
     b.v_stage = c.take<uint8_t>(stage);
@@ -595,7 +595,7 @@ private:
         ap.cap = c.ring ? kChunk : c.cap;
         ap.fp8 = fp8;
         ap.int8 = int8;
-        ap.v4 = m_.cache_v4();   // [V4] the writer must lay the value rows out as the readers see them
+        ap.f4 = m_.cache_f4();   // [F4] the writer must lay the rows out as the readers see them
         ap.q = b().q;
         ap.r = b().r;
         ap.sink = b().sink;
@@ -614,12 +614,12 @@ private:
         aa.chunk_cap = ap.cap;
         aa.fp8 = fp8;
         aa.int8 = int8;
-        aa.v4 = m_.cache_v4();   // [V4]
+        aa.f4 = m_.cache_f4();   // [F4]
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
         if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
-                                  kv_cache_row_bytes(fp8, int8), kv_v_row_bytes(fp8, int8, m_.cache_v4()), strm());   // [V4]
+                                  kv_cache_row_bytes(fp8, int8, m_.cache_f4()), strm());   // [F4] one size, both planes
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());

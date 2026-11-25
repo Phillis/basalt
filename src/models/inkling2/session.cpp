@@ -316,7 +316,7 @@ public:
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         const int64_t E = g_.n_embd, R = kWindowRows;
         const int call_rows = call_rows_of(m_);
-        const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8());
+        const size_t row_bytes = (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_f4());
         const int64_t ctx = m_.context();
         int max_slot = 0;
         for (const Visit& v : g_.visits) max_slot = std::max(max_slot, v.slot);
@@ -329,18 +329,17 @@ public:
             c.ring = g_.swa[(size_t) v.layer];
             c.cap = c.ring ? (int64_t) g_.window + kWindowRows : ctx;
             const size_t bytes = (size_t) kKvHeads * (size_t) c.cap * row_bytes;
-            const size_t v_bytes = (size_t) kKvHeads * (size_t) c.cap * v_row_bytes();   // [V4]
             if (!c.ring && m_.elastic()) {   // the elastic KV: the range reserved, its first kElasticKvBase cells backed
                 for (int j = 0; j < 2; ++j) {
                     auto a = std::make_unique<core::ElasticArray>();
-                    const size_t nb = j ? v_bytes : bytes;
-                    if (ok && (!a->open(nb, err) || !a->ensure((j ? v_cell_bytes() : cell_bytes()) * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
+                    const size_t nb = bytes;
+                    if (ok && (!a->open(nb, err) || !a->ensure(cell_bytes() * (uint64_t) core::kElasticKvBase, 0, err))) ok = false;
                     (j ? c.v : c.k) = a->data();
                     elastic_.push_back(std::move(a));
                 }
             } else {
                 c.k = alloc(bytes, ok);
-                c.v = alloc(v_bytes, ok);   // [V4]
+                c.v = alloc(bytes, ok);
             }
             c.k_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
             c.v_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
@@ -765,18 +764,14 @@ public:
     // the convolutions' rings by checkpoint (running_state). A window ring holds window + kWindowRows positions and a
     // convolution ring kConvRing, so a checkpoint at `pos` is intact while the session has not run more than kWindowRows
     // rows past it.
-    size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8()); }
+    size_t row_bytes() const { return (size_t) kv_cache_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_f4()); }
     static model::Result stale() {
         return {model::Status::Error, "inkling2: a failed read left the conversation's state unknown: start it over or restore a checkpoint"};
     }
     uint64_t cell_bytes() const { return (uint64_t) kKvHeads * row_bytes(); }
-    /// [V4] A value row's bytes: the four-bit row when kv=fp8v4, else the key's own format.
-    size_t v_row_bytes() const { return (size_t) kv_v_row_bytes(m_.cache_fp8(), m_.cache_int8(), m_.cache_v4()); }
-    uint64_t v_cell_bytes() const { return (uint64_t) kKvHeads * v_row_bytes(); }
-    /// [V4] The bytes a cell of the i-th elastic array takes: the arrays are K,V pairs per full visit, and with a
-    /// four-bit V a value cell is smaller than a key cell, so one size for both would reserve the V arrays 1.6x and
-    /// stop a slot at 62.5% of its context.
-    uint64_t cell_bytes_at(size_t i) const { return (i % 2 == 1) ? v_cell_bytes() : cell_bytes(); }
+    /// A cell takes the same bytes in every elastic array: with NVFP4 (and every other format) the key row and the
+    /// value row are one size, so there is no per-array size to get wrong.
+    uint64_t cell_bytes_at(size_t) const { return cell_bytes(); }
 
     static model::Result wedged() { return {model::Status::Error, "inkling2: the model is wedged; restart the engine"}; }
 
@@ -1027,7 +1022,7 @@ public:
         return !m_.wedged();
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * row_bytes(); }
-    size_t v_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * v_row_bytes(); }   // [V4]
+    size_t v_bytes_of(const VisitCache& c) const { return kv_bytes_of(c); }   // the two planes are the same size
     size_t conv_ring_bytes() const { return (size_t) kConvRing * (2 * kKvHeads * kHeadDim + 2 * (size_t) g_.n_embd) * 4; }
 
     size_t running_bytes() const override {
@@ -1074,7 +1069,7 @@ public:
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
         for (const VisitCache& c : vc_)
-            if (!c.ring) n += (size_t) positions * (cell_bytes() + v_cell_bytes());   // [V4] the values are smaller
+            if (!c.ring) n += (size_t) positions * 2 * cell_bytes();
         return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
@@ -1086,7 +1081,7 @@ public:
         cudaStreamSynchronize(stream_);
         kv.clear();
         const size_t run = (size_t) positions * cell_bytes();
-        const size_t v_run = (size_t) positions * v_cell_bytes();   // [V4]
+        const size_t v_run = run;
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
             core::ConversationKv k;
@@ -1096,7 +1091,7 @@ public:
             k.heads = kKvHeads;
             k.head_dim = kHeadDim;
             k.k.resize_for_overwrite(run);
-            k.v.resize_for_overwrite(v_run);   // [V4]
+            k.v.resize_for_overwrite(v_run);
             const auto down = [](const void* dev, core::ConversationBuffer& to) {
                 return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
                     return basalt::core::device_copy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -1115,7 +1110,7 @@ public:
         if (std::string e; !ensure_positions(positions, e)) return grow_failed(e);
         cudaStreamSynchronize(stream_);
         const size_t run = (size_t) positions * cell_bytes();
-        const size_t v_run = (size_t) positions * v_cell_bytes();   // [V4]
+        const size_t v_run = run;
         size_t i = 0;
         for (const VisitCache& c : vc_) {
             if (c.ring) continue;
@@ -1127,7 +1122,7 @@ public:
                     return basalt::core::device_copy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
                 });
             };
-            if (!up(c.k, kv[i].k, run) || !up(c.v, kv[i].v, v_run))   // [V4] each side its own size
+            if (!up(c.k, kv[i].k, run) || !up(c.v, kv[i].v, v_run))
                 return {model::Status::Error, "inkling2: writing a cache back failed"};
             ++i;
         }
@@ -1138,7 +1133,7 @@ public:
 
     int64_t kv_bytes() const override {
         int64_t n = 0;
-        for (const VisitCache& c : vc_) n += (int64_t) (kv_bytes_of(c) + v_bytes_of(c));   // [V4]
+        for (const VisitCache& c : vc_) n += (int64_t) (kv_bytes_of(c) + v_bytes_of(c));
         return n;
     }
 

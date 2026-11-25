@@ -92,8 +92,9 @@ public:
     const model::LoadRequest& flags() const { return flags_; }
     bool cache_fp8() const { return fp8_; }
     bool cache_int8() const { return int8_; }
-    /// [V4] the value rows are four-bit (kv=fp8v4): keys stay E4M3, values take 80 bytes a row instead of 128
-    bool cache_v4() const { return v4_; }
+    /// NVFP4 (kv=nvfp4): both planes 80 bytes a row, an E4M3 scale per 16 values, the keys turned by the normalized
+    /// 128-point Hadamard transform.  A cell is 160 bytes, against fp8's 256.
+    bool cache_f4() const { return f4_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
     /// and windows, so nothing reads the experts while it holds their memory (lend_room).
     ImageEncoder& encoder() const { return vis_; }
@@ -261,7 +262,7 @@ private:
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     int ldev_ = 0;                           ///< the card the weights being planned load to
-    bool fp8_ = false, int8_ = false, v4_ = false;   // [V4] v4_: four-bit value rows
+    bool fp8_ = false, int8_ = false, f4_ = false;   // f4_: NVFP4 keys and values
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
