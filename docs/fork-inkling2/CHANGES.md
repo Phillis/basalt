@@ -4476,3 +4476,50 @@ Result:
 - **needles 3/3 at 64,000 tokens** (with a concurrent decoder in the other slot)
 - **needles 3/3 at 120,000 tokens**
 - no crash, engine alive throughout, 2 x 128k, `cuda0=3.6 GiB ram=11.6 GiB`
+
+## Session 68 - NVFP4 GATE RESULTS: it works, it fails the quality gate, and it is dominated by fp8
+
+Functional gates (all on `nvfp4-kv`, 2 x 128k, `cuda0=3.6 GiB ram=11.6 GiB`):
+
+| gate | result |
+|---|---|
+| parity (`prompt_parity` with the new F4 cases, window and full) | **0 failures** (nvfp4 window 1.125e-03, full 7.986e-04) |
+| Hadamard (`kv4_hadamard128`) | 4/4 checks pass (Walsh matrix 3.0e-07) |
+| Gate 0 | 391, Tokyo |
+| passphrase recall | 841 tokens **ZEBRA-42**; 11,201 tokens (fact at the end) **ZEBRA-42** |
+| needles | **3/3 at 64,000** and **3/3 at 120,000** with a concurrent decoder |
+| stress | 20 rounds, engine alive, 0 faults |
+
+Numerics gate (`tools/ppl_gate.py`, 100 chunks, T=3, the public `inkling2-bf16-base.kld`):
+
+| kv | KLD mean | median | p99 | top-1 | verdict |
+|---|---|---|---|---|---|
+| fp16 | 0.00454 | 0.00217 | 0.0391 | 97.22% | - |
+| **fp8** (control on this build) | **0.00586** | 0.00282 | 0.0502 | **96.80%** | passes |
+| **nvfp4** | **0.01374** | 0.00674 | 0.1153 | **95.04%** | **FAILS** (gate: <= fp8 + 0.0010 = 0.00699; top-1 within 0.15 of fp8) |
+| fp8v4 (our tree, for reference) | 0.01193 | 0.00581 | 0.0998 | 95.33% | - |
+
+The fp8 control reproduces pr650-int's fp8 (0.00599 / 96.65%) within noise, so the harness is sound and nvfp4's **2.3x** cost is real.
+Turning *both* planes to four bits costs more than our fp8v4 (values only): 0.01374 against 0.01193. Keys at four bits are
+the expensive half on this model, which is what the review session predicted - but by more than the Qwen numbers
+suggested (+0.0024 there, +0.0079 here over fp8).
+
+Performance at 2 x 128k (after the fixes, so this is nvfp4's real speed):
+
+| | prefill/stream 30k / 64k | decode/stream 30k / 64k / 96k | hit |
+|---|---|---|---|
+| merged + **nvfp4** | **1,890 / 1,756** | 40.1 / 46.5 / 50.0 | 65-70% |
+| merged + fp8 | 1,753 / 1,606 | 40.6 / 51.6 | 63-79% |
+| our tree + fp8v4 | 1,705 / 1,500 | 46.2 / 44.9 | 83-96% |
+
+So nvfp4 buys **+8% prefill** and *nothing* on decode (it is 10% slower at 64k than fp8, and its smaller KV did **not**
+lift the hit rate as the spec expected - it went to more expert copies on the card instead, 882 against 762, and the hit
+rate stayed 65-70%).
+
+**Verdict, per the spec's stop rule (section 8): nvfp4 does not ship as a profile.** It is implemented, correct and
+documented here, and it is dominated: fp8 has 2.3x better KLD *and* better decode at depth. The decision this hands to
+Phil is the one the spec named - merged base with `fp8` (best quality of any 2-slot config: 0.00586 / 96.8%), or finish
+**fp8v4 on the merged base**, which our own tree shows can reach 46 tok/s at 30k with a KLD of 0.0119 (better than
+nvfp4's) and a KV that is 3.16 GiB against fp8's 3.9. The three bugs found today are exactly what that port needs:
+the decode window's missing format flags, the window pipeline's missing unpack for a four-bit value plane, and the prompt
+path's *second* query implementation in `ops.cu` that has to turn the query too.
