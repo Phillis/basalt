@@ -135,3 +135,37 @@ Three configurations worth naming:
 
 The chunk does not change numerics (a row's forward does not depend on which rows share its chunk), so these are purely
 speed/space trades; the KLD figures above are the format's, measured at the default chunk.
+
+## How the engine is actually used: agent turns and cancels (the switch gate)
+
+`agent_turns.py plain <depth>` (4 turns x 2 sessions, real roles with the assistant reply sent back, session affinity, both
+slots), warm; the reference on pr650-int is 0.9-3.7 s a turn at 40k and 3.4-5.4 s at 100k.
+
+| config | 40k first read | 40k turns 2-4 | 100k first read | 100k turns 2-4 |
+|---|---|---|---|---|
+| **nvfp4 + chunk 5120** | 16.9 / 17.5 s | **2.0 - 2.9 s** | 49.2 / 48.9 s | **2.4 - 3.6 s** |
+| **fp8 + chunk 4096** | 19.8 / 20.6 s | 2.6 - 3.0 s | 57.0 / 61.6 s | 3.0 - 3.9 s |
+
+Reuse works on both (each turn re-reads only the new rows: `cached` = the previous turn's total, to the token), and both are
+inside or better than the reference: at 100k they are 2.4-3.9 s against 3.4-5.4 s. nvfp4+5120 is also **14% faster on the
+first read at 100k** (49.2 s against 57.0 s).
+
+Cancel x5 with the other slot decoding (`cancel5.py`: the client disappears mid-generation five times while a witness
+session keeps decoding): witness completed 4 turns with no errors, both slots answered correctly afterwards (391, 12),
+**0 crash lines**, engine alive.
+
+## The gate matrix (both formats, on the build with no fp8v4 in it)
+
+| gate | fp8 | nvfp4 (group-8 + MSE) |
+|---|---|---|
+| Gate 0 | 391, Tokyo | 391, Tokyo |
+| needles 3/3 at 64,000 | yes (3 runs) | yes |
+| needles 3/3 at 120,000 | yes (3 consecutive runs) | yes |
+| stress 20/20 | yes, 0 crashes | yes, 0 crashes |
+| agent turns 40k / 100k | 2.6-3.0 / 3.0-3.9 s | 2.0-2.9 / 2.4-3.6 s |
+| cancel x5 mid-generation | - | yes |
+| quality (KLD / top-1) | **0.00586 / 96.80%** | 0.01132 / 95.42% |
+
+`fp8v4` does not exist on this build: the adapter takes `fp16`, `fp8`, `int8`, `nvfp4`, and the only `.v4` hits in the tree are
+`float4` uses in qwen4exp kernels. (The live tree `pr650-int` keeps it for now because it is the only cache format that fits
+2 x 128k there - fp8 on that tree is 217 MiB short - and it disappears when the engine moves to this build.)

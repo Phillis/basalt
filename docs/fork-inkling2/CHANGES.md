@@ -4666,3 +4666,17 @@ mix: +19-25% prefill for -4% decode at 30-96k.
 
 Three configurations to choose between: nvfp4+5120 (best mix), nvfp4+8192 (prefill-first), fp8+4096 (quality-first,
 KLD 0.00586).
+
+## Session 68 - the switch gate: agent turns and cancels on both candidates, and the build without fp8v4
+
+`agent_turns.py` (real roles, affinity, both slots, warm): nvfp4+5120 **2.0-2.9 s** a turn at 40k and **2.4-3.6 s** at 100k;
+fp8+4096 2.6-3.0 and 3.0-3.9. The reference on pr650-int is 0.9-3.7 and 3.4-5.4, so both are inside or better, and nvfp4's
+first read at 100k is 14% faster (49.2 s against 57.0 s). Reuse works (each turn reads only its new rows).
+
+Cancel x5 with the other slot decoding: the client disappears mid-generation five times while a witness session keeps
+decoding - witness 4/4 turns, both slots correct afterwards (391, 12), 0 crash lines, engine alive.
+
+`fp8v4` removal: this build has none (adapter takes fp16/fp8/int8/nvfp4; the only `.v4` hits are `float4` in qwen4exp). All
+gates re-run on it for both formats - Gate 0, needles 3/3 at 64k and 120k (three consecutive 120k runs for fp8: an earlier
+2/3 was needle luck, not a defect), stress 20/20 with 0 crashes for each. pr650-int keeps fp8v4 only because it is the sole
+format that fits 2 x 128k there; it goes when the engine moves to this build.
