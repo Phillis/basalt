@@ -4628,3 +4628,24 @@ Measured on the public base, 100 chunks, T=3, same build, same machine:
 which was the review session's bar for calling it the better four-bit format (it returns 1.47 GiB at two 128k slots
 against fp8v4's 0.75, and its prefill was +8%). It still does not pass the strict gate (fp8 + 0.0010 = 0.00699), so the
 choice between "four-bit" and "eight-bit" remains Phil's, but the four-bit option is no longer the worse one.
+
+## Session 68 - NVFP4 is no longer dominated: the corrected, warm picture at 2 x 128k
+
+The "nvfp4 has no decode gain" reading was the cold-first-run artefact again (and a build from before the placement pump).
+Measured warm, both slots decoding, on the current `nvfp4-kv` (group-8 + MSE codec, pump in `decode_kept`):
+
+| kv | KLD / top-1 | prefill 30k / 64k / 96k / 120k | decode 30k / 64k / 96k / 120k |
+|---|---|---|---|
+| **nvfp4** | 0.01132 / 95.42% | **1,768 / 1,678 / 1,503 / 1,415** | **58.6 / 55.3 / 52.9 / 53.6** |
+| fp8 | 0.00586 / 96.80% | 1,632 / 1,540 / 1,377 / 1,281 | 55.8 / 55.2 / 51.7 / 51.1 |
+| fp8v4 (live, our tree) | 0.01193 / 95.33% | 1,840 / 1,558 / 1,375 / 1,245 | 46.8 / 44.3 / 43.1 / 44.8 |
+
+NVFP4: **prefill +8 to +10% at every depth** over fp8, decode +5% at 30k / level at 64-96k / +5% at 120k, and quality better
+than fp8v4's (0.01132 against 0.01193, top-1 95.42% against 95.33%) - all with 1.47 GiB more card room (KV 2.43 GiB against
+fp8's 3.9). So the two real options at two 128k slots are now:
+
+- **fp8** - the best quality of any config (KLD 0.00586, top-1 96.80%), equal decode, 8-10% less prefill.
+- **nvfp4** - 8-10% more prefill and equal-or-better decode, at +0.0055 KLD over fp8 (and better than the format live today).
+
+The strict spec gate (KLD <= fp8 + 0.0010 = 0.00699) is still out of reach for any four-bit cache; the choice between the
+two rows is Phil's, and both are now honest options rather than "one is dominated".

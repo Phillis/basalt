@@ -81,3 +81,32 @@ The merged base fits a full 256k context with **fp8** on one slot: plan `cuda0=2
 
 `kv nvfp4` also fits at 256k (plan `cuda0=3.9 / ram=11.3`) but is not used: its KLD is 2.3x fp8's. `kv fp8v4` does not
 exist on this base (nvfp4 replaced it there).
+
+## The fair comparison (both builds, warm runs, same harnesses, 2 x 128k)
+
+Re-measured on the same day with the warm-up rule applied to both (first curve after a start discarded):
+
+| build | kv | chunk | prefill 30k / 64k / 96k / 120k | decode 30k / 64k / 96k / 120k |
+|---|---|---|---|---|
+| **merged** | fp8 | 4096 | 1,632 / 1,540 / 1,377 / 1,281 | **55.8 / 55.2 / 51.7 / 51.1** |
+| **merged** | fp8 | 5120 | **2,006 / 1,781 / 1,563 / 1,435** | 37.7 / 51.3 / 49.6 / 48.5 |
+| ours (live) | fp8v4 | 5120 | 1,840 / 1,558 / 1,375 / 1,245 | 46.8 / 44.3 / 43.1 / 44.8 |
+
+**The merged base with `kv fp8` wins decode at every depth (+14% to +25%)**, is level on prefill at 96k/120k, and its quality
+is 2x better (KLD 0.00586 against 0.01193). Our tree keeps two things: prefill at 30k (1,840 against 1,632) and decode at no
+depth. With `--prompt-chunk 5120` the merged base also wins prefill at **every** depth (2,006 / 1,781 / 1,563 / 1,435) while
+keeping decode at 64k+ (51.3 / 49.6 / 48.5); the only thing it gives up is 30k decode (37.7 against 46.8).
+
+So: **decode-first -> merged + fp8 + chunk 4096. Prefill-first (agent turns that add a lot of context) -> merged + fp8 +
+chunk 5120.** Both are better than the live configuration wherever 128k sessions actually spend their time.
+
+## Session 68 final: the two real options at 2 x 128k (warm, both slots decoding)
+
+| kv | KLD / top-1 | prefill 30k/64k/96k/120k | decode 30k/64k/96k/120k | KV at 2 x 128k |
+|---|---|---|---|---|
+| **fp8** | **0.00586 / 96.80%** | 1,632 / 1,540 / 1,377 / 1,281 | 55.8 / 55.2 / 51.7 / 51.1 | 3.9 GiB |
+| **nvfp4** (group-8 + MSE) | 0.01132 / 95.42% | **1,768 / 1,678 / 1,503 / 1,415** | **58.6 / 55.3 / 52.9 / 53.6** | 2.43 GiB |
+
+fp8 is the quality choice; nvfp4 is +8-10% prefill with equal-or-better decode and quality better than the configuration
+live today (fp8v4: 0.01193 / 95.33%). Both pass Gate 0, needles 3/3 at 64k and 120k with a concurrent decoder, and stress
+20/20. One session at 256k: fp8 fits and recalled a fact at 172,001 tokens (~1,660 t/s prefill, ~58 t/s decode).
