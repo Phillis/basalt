@@ -4649,3 +4649,20 @@ fp8's 3.9). So the two real options at two 128k slots are now:
 
 The strict spec gate (KLD <= fp8 + 0.0010 = 0.00699) is still out of reach for any four-bit cache; the choice between the
 two rows is Phil's, and both are now honest options rather than "one is dominated".
+
+## Session 68 - the chunk matrix, warm, and the three configurations worth naming
+
+At two 128k slots (warm, first run discarded), nvfp4 with the group-8 + MSE codec and the placement pump:
+
+| chunk | prefill 30k/64k/96k/120k | decode 30k/64k/96k/120k | plan |
+|---|---|---|---|
+| 4096 | 1,768 / 1,678 / 1,503 / 1,415 | 58.6 / 55.3 / 52.9 / 53.6 | cuda0 3.6 |
+| 5120 | 2,047 / 1,834 / 1,685 / 1,556 | 55.8 / 53.3 / 51.6 / 49.0 | cuda0 3.4 |
+| 8192 | **2,340 / 2,117 / 1,883 / 1,762** | 55.4 / 48.7 / 46.1 / 47.0 | cuda0 2.5 |
+
+**8,192 fits with the four-bit cache and does not with fp8** - the staging buffers it needs are half the size, which is the
+chunk lever the review session predicted. Against fp8 at 4,096 that is +43% / +37% / +37% / +38% prefill. 5,120 is the best
+mix: +19-25% prefill for -4% decode at 30-96k.
+
+Three configurations to choose between: nvfp4+5120 (best mix), nvfp4+8192 (prefill-first), fp8+4096 (quality-first,
+KLD 0.00586).

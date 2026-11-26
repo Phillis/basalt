@@ -110,3 +110,28 @@ chunk 5120.** Both are better than the live configuration wherever 128k sessions
 fp8 is the quality choice; nvfp4 is +8-10% prefill with equal-or-better decode and quality better than the configuration
 live today (fp8v4: 0.01193 / 95.33%). Both pass Gate 0, needles 3/3 at 64k and 120k with a concurrent decoder, and stress
 20/20. One session at 256k: fp8 fits and recalled a fact at 172,001 tokens (~1,660 t/s prefill, ~58 t/s decode).
+
+## The chunk matrix, warm, 2 x 128k (this is the prefill lever)
+
+Prefill is governed by the number of staging passes, `ceil(tokens / chunk)`; a bigger chunk amortises them but its row
+buffers take the card room the expert copies want. The four-bit cache's staging is half fp8's, which is what lets 8,192
+fit here at all (it does not with fp8: "the card is 450 MiB short").
+
+| kv | chunk | prefill 30k / 64k / 96k / 120k | decode 30k / 64k / 96k / 120k | plan |
+|---|---|---|---|---|
+| fp8 | 4096 | 1,632 / 1,540 / 1,377 / 1,281 | 55.8 / 55.2 / 51.7 / 51.1 | cuda0 2.1 |
+| fp8 | 5120 | 2,006 / 1,781 / 1,563 / 1,435 | 37.7 / 51.3 / 49.6 / 48.5 | cuda0 1.8 |
+| **nvfp4** | 4096 | 1,768 / 1,678 / 1,503 / 1,415 | **58.6 / 55.3 / 52.9 / 53.6** | cuda0 3.6 |
+| **nvfp4** | **5120** | **2,047 / 1,834 / 1,685 / 1,556** | 55.8 / 53.3 / 51.6 / 49.0 | cuda0 3.4 |
+| **nvfp4** | **8192** | **2,340 / 2,117 / 1,883 / 1,762** | 55.4 / 48.7 / 46.1 / 47.0 | cuda0 2.5 |
+
+Three configurations worth naming:
+
+- **Best mix - nvfp4 + chunk 5120**: prefill **+25% / +19% / +22% / +22%** over the quality-first row, decode within 4% of
+  it at 30-96k (49.0 at 120k, -9%). KLD 0.01132, top-1 95.42%.
+- **Prefill-first - nvfp4 + chunk 8192**: prefill **2,340 / 2,117 / 1,883 / 1,762 t/s**, i.e. **+43% / +37% / +37% / +38%**
+  over fp8 at 4,096, paying about -12% decode at depth.
+- **Quality-first - fp8 + chunk 4096**: KLD 0.00586, top-1 96.80%, decode unchanged.
+
+The chunk does not change numerics (a row's forward does not depend on which rows share its chunk), so these are purely
+speed/space trades; the KLD figures above are the format's, measured at the default chunk.
