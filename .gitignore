@@ -6,6 +6,9 @@ build-*/
 *.exe
 *.obj
 *.pdb
+__pycache__/
+*.pyc
+basalt_config.json
 server.out
 server.err
 basalt_config.totals.json
