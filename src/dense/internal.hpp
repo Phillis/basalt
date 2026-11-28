@@ -22,7 +22,6 @@ class CudaEncoder;
 namespace basalt::dense {
 
 constexpr int kWindow = 16;       // rows one session's decode window holds
-constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
@@ -133,6 +132,8 @@ public:
     // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
     // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
     kernels::KvFar stage;
+    // an NVFP4 cache: the int8 copy of one attention layer's cells a prompt chunk reads (prompt_cells)
+    kernels::KvInt8 kv8;
     cudaStream_t stage_side = nullptr;
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
@@ -145,6 +146,7 @@ public:
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
+    cudaEvent_t ws_done = nullptr;               // orders non-captured multi-stream accesses to shared ws
     std::unique_ptr<vision::Mmproj> mmproj;
     std::unique_ptr<vision::CudaEncoder> encoder;
     BlockDrafter bd_dec;                         // the block drafter as decode windows run it (its products in Q8 planes)
@@ -206,6 +208,7 @@ struct SessionState {
     float *dlogits = nullptr, *lp = nullptr;     // the drafter's head row and its picks [kWindow][kLogprobStride]
     int32_t* win_tok = nullptr;                  // the last window's tokens (device)
     int64_t tail_cell = -1;
+    int32_t tail_pos3[3] = {};                   // 3D M-RoPE coordinates of tail_cell
     // the block drafter: its context K/V per layer (cyclic, dctx_cap cells), the last window's projected features,
     // its picks and their confidence, and the proposal each pick came from ([kWindow][top_k] candidates and their q)
     std::vector<uint16_t*> dk, dv;
@@ -270,15 +273,15 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
 /// The block drafter's feature projection j of the rows in cs.x into cs.dacc (j == 0 writes it, later ones add).
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j);
 /// After the last layer: the block drafter's context from cs.dacc, or the MTP history.
-bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err);
+bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err, const int32_t* pos3 = nullptr);
 /// The block drafter's context cells at positions pos .. pos + n - 1 from n rows of features `dacc` (device).
 void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
 
 /// The stage on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights on `dev`, the other layers empty):
-/// its memory, before the weights land (attach_prompt_split times both cards' rates once they have).
+/// its memory, before the weights land.
 StagePtr make_prompt_split(Model& main, int dev, int l_min, const Weights& w, std::string& err);
-/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
-/// true; false with empty `err` when it does not (the caller reads them on the main card).
+/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards, true; false with empty `err` when the
+/// read is too short for it (more than two chunks) or the session cannot take it (the caller reads them on the main card).
 /// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
 /// only, as after a stopped read on the main card), true returned.
 bool prompt_split_read(Stage& stage, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
@@ -300,12 +303,12 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
 /// The drafter over n rows of (hidden, next token) pairs at cells c0..c0+n-1: `hid` device rows [n][n_embd] (main's
 /// normed hidden, or the drafter's own output), `tok` device ids of the tokens after them.  Writes its KV; with
 /// `out` (device [n][n_embd]) also its normed output rows and, for the last row, the head's pick and probability
-/// into lp_row (row_logprobs layout, device).  n <= kWindow.
+/// into lp_row (row_logprobs layout, device).  n <= kWindow.  `pos3` (optional, [n][3]): explicit M-RoPE positions.
 bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
-                float* lp_row, std::string& err);
+                float* lp_row, std::string& err, const int32_t* pos3 = nullptr);
 /// The drafter's history over a prompt chunk's pairs (n <= kChunk), KV only: hidden rows `hid`, next tokens `tok`
-/// (device ids) or next rows `emb` (device [n][n_embd]).
+/// (device ids) or next rows `emb` (device [n][n_embd]).  `pos3` (optional, [n][3]): explicit M-RoPE positions.
 bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok, const float* emb, int n, int64_t c0,
-               std::string& err);
+               std::string& err, const int32_t* pos3 = nullptr);
 
 }  // namespace basalt::dense

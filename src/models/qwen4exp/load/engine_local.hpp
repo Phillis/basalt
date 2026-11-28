@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/models/qwen4exp/decode/expert_dispatch.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
@@ -32,17 +33,15 @@
 #include "basalt/core/weights.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 
-#include "basalt/program/multi_gpu_plan.hpp"   // PsPrice
 
 namespace basalt::models::qwen4exp::engine_local {
 
 // Spare RAM places for a saturated adaptation round.
 inline constexpr int kSatBoost = 4;
 
-/// One candidate split price: the plan's cost, the prompt chunk and the head chunk it was measured with, and when the
-/// part is not priced (chunk 0) why not.
-struct SplitPricing {
-    basalt::program::PsPrice price;
+/// How a prompt part is read across the cards: the chunk and the head chunk, or chunk 0 and why it is read on the main card
+/// (empty when it is one chunk).
+struct SplitPart {
     int64_t chunk = 0, head = 0;
     std::string why;
 };
@@ -138,7 +137,17 @@ struct SplitDrive {
 };
 struct SlotDelete {
     bool own = true;
-    void operator()(basalt::core::SessionState* p) const { if (own) delete p; }
+    int dev = -1;
+    void* buf = nullptr;
+    void operator()(basalt::core::SessionState* p) const {
+        if (!own || p == nullptr) return;
+        const basalt::core::OnDevice on(dev);
+        basalt::core::session_release(*p);
+        delete[] p->qsa_states;
+        p->qsa_states = nullptr;
+        if (buf != nullptr) cudaFree(buf);
+        delete p;
+    }
 };
 using SlotSession = std::unique_ptr<basalt::core::SessionState, SlotDelete>;
 
@@ -171,7 +180,7 @@ struct PromptStage {
     int dev = -1;
     size_t tier_at = 0;                   ///< its tier among the expert tiers (0: the first)
     basalt::core::PeerExperts* tier = nullptr;
-    double mem_gbps = 0, link_gbps = 0;   ///< its card's memory bandwidth and probed host->device link
+    double link_gbps = 0;                 ///< its card's probed host->device link
     int64_t lo = 0, hi = 0;               ///< its weights cover layers [lo, hi); a read runs a range inside them
     int64_t l0 = 0, l1 = 0;               ///< the layers of the read in progress
     std::set<std::string> skip;           ///< the tensors outside its layers
@@ -199,6 +208,6 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
                       int64_t layer);
 
 // Shares the hottest profile pairs between the main and peer expert tiers.
-size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, size_t& at, size_t& fill);
+size_t peer_hot_share_order(std::vector<std::pair<int32_t, int32_t>>& profile, double f, size_t& at, size_t& fill);
 
 }  // namespace basalt::models::qwen4exp::engine_local

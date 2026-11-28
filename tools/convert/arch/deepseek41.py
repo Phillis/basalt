@@ -1,9 +1,10 @@
 """DeepSeek-V4.1-Flash (GGUF architecture `deepseek41`).
 
 Every tensor is stored as published: the float tensors in `dense`, the quantized non-expert tensors in `gguf`, the routed
-experts in `experts`, and the Engram table (`per_layer_token_embd.weight`, rows of 256 IQ4_NL values) in a section of its
-own so it can be read by row with O_DIRECT. There is no hc8 section. `--mmproj` adds the vision
-projector GGUF as the `vision/mmproj` section, `--dspark` the DSpark drafter GGUF as `dspark/gguf` (meta.dspark).
+experts in `experts`, and the Engram table (`per_layer_token_embd.weight`, rows of 256 IQ4_NL, Q5_K, Q6_K,
+MXFP4 or MXFP8 values) in a section of its own so it can be read by row with O_DIRECT. There is no hc8 section.
+`--mmproj` adds the vision projector GGUF as the `vision/mmproj` section, `--dspark` the DSpark drafter GGUF as
+`dspark/gguf` (meta.dspark).
 """
 from __future__ import annotations
 
@@ -12,8 +13,13 @@ from . import Arch, gguf_stem, register
 ENGRAM_TENSOR = "per_layer_token_embd.weight"
 ENGRAM_SECTION = "engram"
 ENGRAM_ROW_VALUES = 256
-IQ4_NL = 20
-IQ4_NL_BLOCK = (32, 18)       # values, bytes
+IQ4_NL, Q5_K, Q6_K, MXFP4, MXFP8 = 20, 13, 14, 39, 43
+# the Engram types the engine reads: ggml type -> (values in a block, bytes in a block). Keep in sync with
+# engram_block in src/models/deepseek41/engram_rows.hpp. MXFP8 is type 43 as Unsloth's standalone table
+# stores it (one E8M0 scale, then 32 E4M3 codes), which is not what the type's GGUF block geometry says
+# (one byte per value).
+ENGRAM_BLOCKS = {IQ4_NL: (32, 18), Q5_K: (256, 176), Q6_K: (256, 210), MXFP4: (32, 17), MXFP8: (32, 33)}
+ENGRAM_TYPES = "IQ4_NL, Q5_K, Q6_K, MXFP4 or MXFP8"
 
 # The LICENSE file of the official model repository, with LF line endings.
 MIT = """MIT License
@@ -61,6 +67,15 @@ ENGRAM_KEYS = (
 )
 
 
+def engram_row_bytes(type_id: int, row_values: int) -> int:
+    """Bytes of one Engram row of `type_id` holding `row_values` values; 0 for a type the rows cannot have, and for a
+    row that is not whole blocks of it. The engine's own check (src/models/deepseek41/engram_rows.hpp) is the same."""
+    block = ENGRAM_BLOCKS.get(type_id)
+    if block is None or row_values <= 0 or row_values % block[0]:
+        return 0
+    return row_values // block[0] * block[1]
+
+
 class DeepSeek41(Arch):
     name = "deepseek41"
     not_in_dense = frozenset({ENGRAM_TENSOR})
@@ -89,9 +104,10 @@ class DeepSeek41(Arch):
         t = own.get(ENGRAM_TENSOR)
         if t is None:
             raise ConvertError(f"the model has no {ENGRAM_TENSOR} (the Engram table)")
-        if t.type_id != IQ4_NL or len(t.shape) != 2 or int(t.shape[0]) != ENGRAM_ROW_VALUES:
+        if engram_row_bytes(t.type_id, ENGRAM_ROW_VALUES) == 0 or len(t.shape) != 2 \
+                or int(t.shape[0]) != ENGRAM_ROW_VALUES or self.own_section_bytes(ENGRAM_TENSOR, t) is None:
             raise ConvertError(f"{ENGRAM_TENSOR} is {t.type_name} {list(t.shape)}; expected rows of "
-                               f"{ENGRAM_ROW_VALUES} IQ4_NL values")
+                               f"{ENGRAM_ROW_VALUES} {ENGRAM_TYPES} values")
         want = kv.get(P + "embedding_length_per_layer_input")
         if want is not None and int(want) != ENGRAM_ROW_VALUES:
             raise ConvertError(f"embedding_length_per_layer_input is {want}, the Engram rows hold {ENGRAM_ROW_VALUES}")
@@ -101,8 +117,7 @@ class DeepSeek41(Arch):
 
     def meta_extra(self, kv, tensors, own):
         t = own[ENGRAM_TENSOR]
-        vals, nbytes = IQ4_NL_BLOCK
-        row_bytes = ENGRAM_ROW_VALUES // vals * nbytes
+        row_bytes = engram_row_bytes(t.type_id, ENGRAM_ROW_VALUES)
         return {
             "arch": self.name,
             "geometry": {k: kv[P + k] for k in GEOMETRY_KEYS if P + k in kv},
@@ -111,7 +126,16 @@ class DeepSeek41(Arch):
                        "bytes": int(t.shape[1]) * row_bytes,
                        **{k: kv[P + k] for k in ENGRAM_KEYS if P + k in kv},
                        "token_map": "gguf_kv:" + P + "engram.token_map"},
-        }
+            }
+
+    def own_section_bytes(self, name, tensor):
+        if name == ENGRAM_TENSOR:
+            geom = ENGRAM_BLOCKS.get(tensor.type_id)
+            if geom is not None:
+                vals, nbytes = geom
+                return tensor.elements // vals * nbytes
+        # a type the rows cannot have keeps the GGUF geometry, so `check` reports it
+        return tensor.expected_bytes()
 
 
 register(DeepSeek41())

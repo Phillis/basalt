@@ -23,6 +23,7 @@ from serve.config import (  # noqa: E402
     SAMPLING_KEYS,
     budget_count,
     build_parser,
+    cost_rate,
     check_engine_flags,
     engine_flags_of,
     load_config_file,
@@ -110,16 +111,16 @@ class ConfigFile(unittest.TestCase):
 
     def test_the_exact_shape(self):
         p = conf({"engine": {"conversation-cache-disk-mib": 32768, "idle-sleep": 300, "pool-workers": 8, "vram-reserve-mib": 500},
-                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "auto", "kv": "int8", "max-context": 262144,
-                              "model": "a.basalt", "parallel": 4, "slot-full-context": True, "vision": "dynamic"},
-                             {"alias": "DeepSeek V4.1 Flash", "gpu": "auto", "max-context": 1048576,
+                  "models": [{"alias": "Qwen 3.8 FN", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144,
+                              "model": "a.basalt", "parallel": 4, "vision": "dynamic"},
+                             {"alias": "DeepSeek V4.1 Flash", "gpu": [0, 1], "gpu-mode": "peer", "gpu-share": [3, 1], "max-context": 1048576,
                               "model": "b.basalt", "vision": "dynamic"}],
                   "server": {"host": "0.0.0.0", "port": 8080}})
         (qwen, _, qfile, _), (ds, _, dfile, _) = model_settings(build_parser(), ["--config", p])
-        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
-                         ("Qwen 3.8 FN", 4, "auto", "dynamic", 300, "0.0.0.0", 8080))
-        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.vision, ds.idle_sleep, ds.host, ds.port),
-                         ("DeepSeek V4.1 Flash", None, "auto", "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((qwen.alias, qwen.parallel, qwen.gpu, qwen.gpu_mode, qwen.gpu_share, qwen.vision, qwen.idle_sleep, qwen.host, qwen.port),
+                         ("Qwen 3.8 FN", 4, "all", "peer", None, "dynamic", 300, "0.0.0.0", 8080))
+        self.assertEqual((ds.alias, ds.parallel, ds.gpu, ds.gpu_mode, ds.gpu_share, ds.vision, ds.idle_sleep, ds.host, ds.port),
+                         ("DeepSeek V4.1 Flash", None, "0,1", "peer", "3,1", "dynamic", 300, "0.0.0.0", 8080))
         for words in (qfile, dfile):
             self.assertEqual(flag_value(words, "--pool-workers"), "8")
             self.assertEqual(flag_value(words, "--vram-reserve-mib"), "500")
@@ -127,8 +128,34 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--kv"), "int8")
         self.assertIsNone(flag_value(dfile, "--kv"))
         self.assertEqual(flag_value(qfile, "--batch"), "4")
-        self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
+        self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # every slot reaches the whole context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
+
+    def test_model_entry_boolean_false_overrides_engine_true(self):
+        p = conf({
+            "version": 2,
+            "engine": {
+                "fit-max-tokens": True,
+                "grammar": True,
+                "resident-experts": True,
+                "route-tail-skip": 7,
+            },
+            "models": [
+                {"model": "a.basalt", "parallel": 2, "max-context": 8192},
+                {"model": "b.basalt", "parallel": 2, "max-context": 8192,
+                 "fit-max-tokens": False, "grammar": False,
+                 "resident-experts": False, "route-tail-skip": False},
+            ],
+        })
+        (a, _, afile, _), (b, _, bfile, _) = model_settings(build_parser(), ["--config", p])
+        self.assertTrue((a.fit_max_tokens, a.grammar) == (True, True))
+        self.assertEqual(flag_value(afile, "--max-context"), "8192")
+        self.assertIn("--resident-experts", afile)
+        self.assertEqual(flag_value(afile, "--route-tail-skip"), "7")
+        self.assertEqual((b.fit_max_tokens, b.grammar), (False, False))
+        self.assertEqual(flag_value(bfile, "--max-context"), "8192")
+        self.assertNotIn("--resident-experts", bfile)
+        self.assertNotIn("--route-tail-skip", bfile)
 
     def test_the_ram_reserve(self):
         p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
@@ -185,7 +212,7 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual((a.vision, b.vision), ("cpu", "cpu"))
         self.assertEqual(acli, ["--kv", "int8"])
         self.assertEqual(bcli, ["--kv", "int8"])
-        self.assertEqual(flag_value(afile, "--max-context"), "4096")
+        self.assertEqual(flag_value(afile, "--max-context"), "8192")
 
     def test_errors(self):
         ap = build_parser()
@@ -199,7 +226,7 @@ class ConfigFile(unittest.TestCase):
                          ({"models": [entry, {"model": "b", "port": 1}]}, "models\\[1\\].port: a server option"),
                          ({"models": [{"model": "b", "vision": True}]}, "vision: use one of"),
                          ({"models": [{"model": "b", "parallel": [1]}]}, "one value"),
-                         ({"models": [{"model": "b", "slot-full-context": 1}]}, "true or false"),
+                         ({"models": [{"model": "b", "fit-max-tokens": 1}]}, "true or false"),
                          ({"models": [entry], "server": {"nope": 1}}, "not a server option"),
                          ({"models": [entry], "server": {"spec": 7}}, "not a server option \\(engine flags go under"),
                          ({"models": [entry], "server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
@@ -281,11 +308,6 @@ class Precedence(unittest.TestCase):
         _, _, _, cli_words = parse(["--route-tail-skip", "--resident-experts"])
         self.assertEqual(cli_words, ["--route-tail-skip", "--resident-experts"])
 
-    def test_no_peer_prefill_config_words(self):
-        for value, words in ((True, ["--no-peer-prefill"]), (False, [])):
-            _, _, file_words, _ = parse([], {"engine": {"no-peer-prefill": value}})
-            self.assertEqual(file_words, words)
-
     def test_route_prior_config_words(self):
         _, _, file_words, _ = parse([], {"engine": {"route-prior": 1.5}})
         self.assertEqual(file_words, ["--route-prior", "1.5"])
@@ -320,6 +342,9 @@ class Precedence(unittest.TestCase):
             check_engine_flags(["--peer-device", "1"], {"--gpu"}, "cli")
         with self.assertRaisesRegex(ValueError, "gpu is a server setting"):
             check_engine_flags(["--gpu", "0,1"], {"--gpu"}, "--config c.json")
+        for flag in ("--gpu-mode", "--gpu-share"):
+            with self.assertRaisesRegex(ValueError, f"{flag[2:]} is a server setting"):
+                check_engine_flags([flag, "peer"], {flag}, "--config c.json")
 
     def test_extras(self):
         self.assertEqual(split_engine_extras(["--kv", "int8", "--resident-experts", "--seed=3", "--x", "-1"]),
@@ -400,6 +425,19 @@ class SamplingOptions(unittest.TestCase):
         self.assertEqual(a.sampling_launch, {"top_k": 0, "seed": 0, "presence_penalty": -0.5, "penalty_last_n": 4096})
         self.assertEqual(parse(["--top-k", "1000"])[0].sampling_launch, {"top_k": 1000})
 
+    def test_seed_keeps_full_64bit_precision(self):
+        from serve.config import checked_sampling
+        for exact in (2 ** 53 + 1, 2 ** 64 - 1, -(2 ** 63)):
+            a = parse(["--seed", str(exact)])[0]
+            self.assertEqual(a.seed, exact)
+            self.assertIsInstance(a.seed, int)
+            checked_sampling({"seed": exact})
+        for huge in (2 ** 64, -(2 ** 63) - 1, 10 ** 400):
+            with self.assertRaises(SystemExit, msg=str(huge)):
+                parse(["--seed", str(huge)])
+            with self.assertRaises(ValueError, msg=str(huge)):
+                checked_sampling({"seed": huge})
+
     def test_the_model_file_check_is_the_same(self):
         with self.assertRaisesRegex(SystemExit, "sampling.top_k=-5"):
             sampling_defaults_from_config({"sampling": {"top_k": -5}})
@@ -429,34 +467,28 @@ class ThinkingBudget(unittest.TestCase):
 
 
 class SlotContext(unittest.TestCase):
-    """--max-context is shared by the --parallel slots unless --slot-full-context."""
+    """Every --parallel slot reaches the whole --max-context."""
 
     def context(self, cli, cfg=None):
         _, _, file_words, cli_words = parse(cli, cfg)
-        return int(flag_value(file_words + cli_words, "--max-context"))
+        return flag_value(file_words + cli_words, "--max-context")
 
-    def test_each_slot_gets_an_equal_part(self):
-        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"]), 65536)
-        self.assertEqual(self.context(["--parallel", "2", "--max-context", "262144"]), 131072)
-        self.assertEqual(self.context(["--max-context", "262144"]), 262144)                  # solo: whole
-        self.assertEqual(self.context(["--parallel", "4"], {"engine": {"max-context": 8192}}), 2048)
-        self.assertEqual(self.context(["--parallel", "2", "--max-context", "65536"],
-                                      {"engine": {"max-context": 8192}}), 32768)
+    def test_every_slot_reaches_the_whole_context(self):
+        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"]), "262144")
+        self.assertEqual(self.context(["--max-context", "262144"]), "262144")
+        self.assertEqual(self.context(["--parallel", "4"], {"engine": {"max-context": 8192}}), "8192")
+        self.assertIsNone(self.context(["--parallel", "4"]))                    # the engine's own default
 
-    def test_the_default_is_shared_once_the_engine_names_it(self):
-        from serve.config import slot_share
-        a, _, file_words, cli_words = parse(["--parallel", "4"])
-        self.assertIsNone(flag_value(file_words + cli_words, "--max-context"))      # the engine's plan gives the total
-        self.assertTrue(a.split_default)
-        self.assertEqual(slot_share(8192, 4), 2048)
-        self.assertEqual(slot_share(512, 4), 256)                                     # never under the least slot
+    def test_parallel_takes_up_to_64(self):
+        a, *_ = parse(["--parallel", "64", "--max-context", "262144"])
+        self.assertEqual(a.parallel, 64)
+        for bad in ("0", "65"):
+            with self.subTest(value=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse(["--parallel", bad])
 
-    def test_the_slot_line_shows_each_slots_context(self):
+    def test_the_slot_line_shows_each_slots_reach(self):
         from serve.config import slots_text
-        a, *_ = parse(["--parallel", "8", "--max-context", "262144"])
-        self.assertEqual(slots_text(8, 32768, a.shared_context), "slots 8 \u00d7 32768 ctx (slot-full-context: 262144 each)")
-        a, *_ = parse(["--parallel", "8", "--max-context", "262144", "--slot-full-context"])
-        self.assertEqual(slots_text(8, 262144, getattr(a, "shared_context", None)), "slots 8 \u00d7 262144 ctx")
+        self.assertEqual(slots_text(8, 262144, True), "slots 8 \u00d7 up to 262144 ctx")
 
     def test_parallel_conflicts_with_batch_and_slots(self):
         for flag in ("--batch", "--slots"):
@@ -467,18 +499,35 @@ class SlotContext(unittest.TestCase):
         _, _, file_words, cli_words = parse(["--parallel", "2"])
         self.assertEqual(flag_value(cli_words, "--batch"), "2")
 
-    def test_engine_line_shows_the_division(self):
+    def test_engine_line_shows_the_context_as_given(self):
         ap = build_parser()
-        a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
-        items = start_items(file_words, cli_words, (a.shared_context, a.parallel))
-        self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
-        self.assertIn("ctx=16384 (65536/4 slots)", items)
-        self.assertNotIn("slots", " ".join(start_items(file_words, cli_words)))
+        _, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
+        self.assertIn("ctx=65536", start_items(file_words, cli_words))
 
-    def test_slot_full_context_keeps_the_whole(self):
-        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144", "--slot-full-context"]), 262144)
-        self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"],
-                                      {"server": {"slot-full-context": True}}), 262144)
+    def test_slot_full_context_is_gone(self):
+        """No longer a server option: an engine word, which the engine refuses."""
+        _, _, file_words, cli_words = parse(["--parallel", "4", "--slot-full-context"])
+        self.assertIn("--slot-full-context", cli_words)
+        with self.assertRaisesRegex(ValueError, "--slot-full-context is not an engine flag"):
+            check_engine_flags(cli_words, {"--batch", "--max-context"}, "command line")
+        (_, _, file_words, _), = model_settings(build_parser(), ["--config", conf({"models": [{"model": "a.basalt", "slot-full-context": True}]})])
+        self.assertIn("--slot-full-context", file_words)
+
+    def test_kv_pool_setting(self):
+        """On by default (no engine word); --no-kv-pool or "kv-pool": false asks the engine for --kv-pool off, and the
+        context stays per slot as given."""
+        _, _, file_words, cli_words = parse(["--parallel", "4", "--max-context", "65536"])
+        self.assertNotIn("--kv-pool", file_words + cli_words)
+        a, _, file_words, cli_words = parse(["--parallel", "4", "--max-context", "65536", "--no-kv-pool"])
+        self.assertFalse(a.kv_pool)
+        self.assertEqual(flag_value(cli_words, "--kv-pool"), "off")
+        self.assertEqual(flag_value(cli_words, "--max-context"), "65536")
+        (a, _, file_words, _), = model_settings(build_parser(), ["--config", conf({"models": [{"model": "a.basalt", "kv-pool": False}]})])
+        self.assertFalse(a.kv_pool)
+        self.assertEqual(flag_value(file_words, "--kv-pool"), "off")
+        from serve.config import slots_text
+        self.assertEqual(slots_text(4, 65536, True), "slots 4 \u00d7 up to 65536 ctx")
+        self.assertEqual(slots_text(4, 65536, False), "slots 4 \u00d7 65536 ctx")
 
     def test_answer_room_setting(self):
         """auto by default; auto or a whole number of tokens by the command line or the config; anything else is refused."""
@@ -515,7 +564,7 @@ class EveryOption(unittest.TestCase):
             return "1"
         if act.type is video_tokens:
             return 1024
-        if act.type is float:
+        if act.type is float or act.type is cost_rate:   # --cost-*: a price per million tokens
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply
             return 0.5 if SAMPLING_KEYS[act.dest][0] is float else 7
@@ -526,8 +575,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            # grammar is on by default: its no- form differs (test_grammar)
-            if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
+            # grammar and kv-pool are on by default: their no- forms differ (test_grammar, test_kv_pool_setting)
+            if name in ("api-key", "api-key-file", "engine-bin", "grammar", "kv-pool"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
@@ -623,7 +672,11 @@ class Startup(unittest.TestCase):
         code, err = self.run_server({"models": [entry]})
         self.assertIn("the server needs --model and the engine binary", err)
         code, err = self.run_server({"models": [{**entry, "gpu": "a,b"}], "server": {"mock-engine": True}})
-        self.assertIn("--gpu a,b: expected numbers", err)
+        self.assertIn('gpu "a,b": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md', err)
+        code, err = self.run_server({"models": [{**entry, "gpu": "0,1"}], "server": {"mock-engine": True}})
+        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md", err)
+        code, err = self.run_server({"models": [{**entry, "gpu": 0, "gpu-mode": "peer"}], "server": {"mock-engine": True}})
+        self.assertIn('gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more', err)
         code, err = self.run_server({"models": [entry]}, "--mock-engine", "--api-key", "")
         self.assertEqual(code, 2)
         self.assertIn("--api-key is empty", err)

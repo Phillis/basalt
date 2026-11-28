@@ -7,9 +7,11 @@
 #include <vector>
 
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/model/route_flags.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/program/gpu_select.hpp"
 
 namespace basalt::program {
 
@@ -40,14 +42,7 @@ struct CommonOptions {
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (the model's hit kernel).
     int expert_cache = 0;
-    /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
-    /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
-    /// (-1 = adapt_swaps).
-    int peer_device = -1;
-    /// every expert tier's device, the first one peer_device, and each card's memory bandwidth (GB/s, 0 unknown)
-    std::vector<int> peer_devices;
-    std::vector<double> peer_gbps;
-    double main_gbps = 0;         ///< the main card's memory bandwidth (GB/s, 0 unknown)
+    /// Multi-GPU: the VRAM a card after the main one leaves free
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
@@ -58,9 +53,12 @@ struct CommonOptions {
     /// --kv-resident N: K/V streaming, N cells of each attention layer in VRAM and the rest in page-locked RAM (0: all in
     /// VRAM), for the models that take it
     int64_t kv_resident = 0;
-    /// --diag-split-at N: diagnostic, a model split across two cards at layer N whatever the start would pick (0: off)
+    /// --ple-io direct|ram: how the n-gram table is read (direct = unbuffered SSD reads, ram = memory-mapped in RAM),
+    /// for the models with an n-gram table
+    std::string ple_io = "direct";
     int diag_rows = 0;
-    int diag_split_at = 0;
+    /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
+    int diag_gpu_cut = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
@@ -72,6 +70,7 @@ struct CommonOptions {
     /// --grammar on|off: a request's "grammar" key is enforced on the sampled tokens (the vocabulary is read from the
     /// pack at start).  Off: the key is ignored and the decode loop pays one pointer test per window.
     bool grammar = false;
+    bool kv_pool = true;               ///< --kv-pool on|off: a model with a KV pool backs every slot's cells from it (off: each slot's own, fixed)
     /// --serve runs up to this many sequences at once, one token each per batch window (0 = off).  A request
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id> [<id> ...]` lines, then `BDONE <slot> ...`).
@@ -84,8 +83,10 @@ struct CommonOptions {
     /// --ram-reserve-mib: the RAM left free for the rest of the system (platform::ram_reserve); 0 turns the guard off.
     int64_t ram_reserve_mib = (int64_t) (basalt::platform::kDefaultRamReserveBytes >> 20);
     std::vector<int64_t> eos_ids;
-    /// --gpu: the cards this run uses (gpu_select.hpp); empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
-    std::string gpu;
+    /// --gpu, --gpu-mode, --gpu-share: the cards this run uses, what they do together and their shares (gpu_select.hpp);
+    /// empty = GPU 0 alone.  --gpu-plan prints the choice and exits.
+    std::string gpu, gpu_mode, gpu_share;
+    basalt::model::GpuCards gpus;      ///< the cards chosen, main first, with their mode and shares (set by cli::select_gpus)
     bool gpu_plan = false;
     std::string arch;                  ///< the --model file's architecture
     std::string ppl_base, ppl_out;     ///< --ppl-base, --ppl-out
@@ -114,6 +115,10 @@ struct CommonOptions {
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
     bool diag_batch_check = false;         ///< --diag-batch-check: the batch conformance check over --batch N sessions (model/batch_check.hpp)
+    bool diag_gpu_check = false;           ///< --diag-gpu-check: the several-GPUs conformance check over --tokens-file (model/gpu_check.hpp)
+    bool diag_gpu_same = false;            ///< --diag-gpu-same: gpu-mode split with both stages on one GPU (split_same), the split's bitwise reference
+    std::string diag_gpu_trace;            ///< --diag-gpu-trace FILE: the check writes its logits and picks there
+    std::string diag_gpu_ref;              ///< --diag-gpu-ref FILE: the check compares its run with that trace
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N
     std::vector<int64_t> image_at;
     bool image_pad_given = false;
@@ -133,6 +138,9 @@ struct CommonOptions {
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
     /// RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    /// --serve: the page-locked RAM, in MiB, the checkpoints of every chain share (the solo session's and every batch
+    /// slot's).  Held from the start; when the chains hold more than it fits, the least recently used checkpoint leaves.
+    int64_t checkpoint_pool_mib = 4096;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;

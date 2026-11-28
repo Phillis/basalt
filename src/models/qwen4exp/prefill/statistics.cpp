@@ -1,3 +1,4 @@
+#include "basalt/core/device_copy.hpp"
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
@@ -41,7 +42,7 @@ bool Prefill::route_hist_take(std::vector<uint32_t>& out, int64_t& tokens) {
         const core::OnDevice od(m.device);
         cudaStreamSynchronize(m.cs);
         std::vector<uint32_t> h((size_t) m.hist_n);
-        if (cudaMemcpy(h.data(), m.hist, (size_t) m.hist_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        if (basalt::core::device_copy(h.data(), m.hist, (size_t) m.hist_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
         if (out.size() != h.size()) out.assign(h.size(), 0u);
         for (size_t i = 0; i < h.size(); ++i) out[i] += h[i];
         tokens = std::max(tokens, m.hist_tokens);
@@ -52,7 +53,9 @@ bool Prefill::route_hist_take(std::vector<uint32_t>& out, int64_t& tokens) {
 
 void Prefill::set_ple_warm(const int64_t* tokens, int64_t run_pos0, int64_t from, int64_t to) {
     Impl& m = *impl_;
+    m.warm.stop.store(true, std::memory_order_release);
     if (m.warm.fut.valid()) m.warm.fut.wait();
+    m.warm.stop.store(false, std::memory_order_relaxed);
     m.warm.pending = false;
     if (m.ss == nullptr || !m.ss->ple.ready() || m.ss->ple.table == nullptr || from < 2) return;
     const int64_t cap = (int64_t) (m.ss->ple.table->cache_rows() / (2 * basalt::kernels::PLE_N_HEADS));

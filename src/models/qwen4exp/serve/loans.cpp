@@ -8,21 +8,24 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
-#include "basalt/program/multi_gpu_plan.hpp"   // prompt_one_card_chunks, prompt_chunk_list
+#include "basalt/prefill/chunk_plan.hpp"
 
 #include "../load/engine_local.hpp"   // biggest_chunk
 
 namespace basalt::models::qwen4exp::serve {
 
 int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need) {
+    if (need == 0) return 0;
     if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
+        if (xc.slots() <= 0 || xc.bytes() <= 0 || need > (uint64_t) xc.bytes()) return xc.slots() + 1;
         int64_t k = 0;
         while (k < xc.slots() &&
                (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
         return k;
     }
     const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
-    return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+    if (blob <= 0) return xc.slots() + 1;
+    return (int64_t) ((need - 1) / (uint64_t) blob + 1);
 }
 
 int64_t lend_slots(const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,
@@ -40,11 +43,11 @@ int64_t request_chunk(int64_t tokens, int64_t max_chunk) {
 
 std::pair<int64_t, int64_t> one_card_chunks(int64_t tokens, int64_t cap, bool head_ok, bool auto_fit) {
     constexpr int64_t kHeadChunk = 16384;   // the first chunk of a prompt above the chunk cap
-    return basalt::program::prompt_one_card_chunks(tokens, cap, head_ok && auto_fit, kHeadChunk);
+    return basalt::prefill::one_card_chunks(tokens, cap, head_ok && auto_fit, kHeadChunk);
 }
 
 std::vector<int64_t> chunk_list(int64_t tokens, int64_t chunk, int64_t head) {
-    return basalt::program::prompt_chunk_list(tokens, chunk, head);
+    return basalt::prefill::chunk_list(tokens, chunk, head);
 }
 
 int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const basalt::core::ModelGeometry& g,

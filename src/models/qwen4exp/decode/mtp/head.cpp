@@ -1,3 +1,5 @@
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 
 namespace basalt::core {
@@ -41,7 +43,7 @@ namespace {
 // What to change when the draft head's token subset does not fit the VRAM left.  Text only, after the failure.
 void draft_head_hint(int64_t n_tokens, uint64_t bytes) {
     size_t free_b = 0, total_b = 0;
-    const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+    const bool have_free = basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess;
     std::string free_s;
     if (have_free) {
         char b[64];
@@ -127,7 +129,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             }
             rows_mapped_ = mapped;
             if (mapped) {
-                cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
                 vram_ += map.size() * 4;
                 basalt::log::info("basalt mtp", "draft head over %lld tokens (rows read from the main head)",
                              (long long) n_dvocab_);
@@ -135,11 +137,11 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 // unused context rows read the first row's weights for the gather, then take their id -1
                 std::vector<int32_t> gmap = map;
                 for (int32_t& v : gmap) if (v < 0) v = ids[0];
-                cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
                 basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_,
                                              nullptr);
                 cudaDeviceSynchronize();
-                cudaMemcpy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
+                basalt::core::device_copy(dvocab_, map.data(), map.size() * 4, cudaMemcpyHostToDevice);
                 vram_ += (uint64_t) (n_dvocab_ * row_bytes) + map.size() * 4 + (uint64_t) n_xcap_ * 4;
                 basalt::log::info("basalt mtp", "draft head over %lld tokens (%.1f MiB)", (long long) n_dvocab_,
                              (double) (n_dvocab_ * row_bytes) / 1048576.0);
@@ -152,7 +154,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 if (cudaMalloc((void**) &proxy_, pb) == cudaSuccess && cudaMalloc(&proxy_scratch_, sb) == cudaSuccess) {
                     cudaMemset(proxy_, 0, pb);
                     if (head->type() == 13) basalt::kernels::q5k_proxy_pack(dhead_, 0, n_tier1_, proxy_, n_tier1_, nullptr);
-                    else if (head->type() == GGML_Q8_0)   // the context rows (id -1 for now) are packed as they fill
+                    else if (head->type() == GGML_Q8_0)   // the context rows (id -1) are packed as they fill
                         basalt::kernels::q80_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);
                     else if (mapped)
                         basalt::kernels::q6k_proxy_pack(head->weights(), 0, n_tier1_, proxy_, n_tier1_, nullptr, dvocab_);

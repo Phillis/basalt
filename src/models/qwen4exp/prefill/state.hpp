@@ -13,6 +13,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <algorithm>
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <future>
@@ -52,6 +53,8 @@ struct Prefill::Impl {
     std::vector<int32_t> steps_host;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
+    float* tp_ref_sc = nullptr;           // --exp qsa_two_pass_check=1: the 3xTF32 row and ids, on this stage's card
+    int32_t* tp_ref_ids = nullptr;
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
@@ -142,6 +145,7 @@ struct Prefill::Impl {
         std::vector<int64_t> tok;            // tokens[from - 2, to)
         int64_t run_pos0 = 0, to = 0;
         bool pending = false;
+        std::atomic<bool> stop{false};
         std::future<void> fut;
     } warm;
 };

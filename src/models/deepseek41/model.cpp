@@ -8,6 +8,7 @@
 
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "models/deepseek41/attn_batch.hpp"
@@ -17,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 namespace basalt::models::deepseek41 {
@@ -28,7 +30,7 @@ DsModel::~DsModel() {
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
 }
 
-bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& err) {
+bool DsModel::load(const std::string& path, core::LoadPlan& plan, bool ple_ram, std::string& err) {
     if (!open_pack(path, pack_, err)) return false;
     path_ = path;
     cudaGetDevice(&device_);
@@ -42,7 +44,15 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     desc_.n_ff_exp = g.n_ff_exp;
     desc_.n_expert_shared = g.n_shared;
     desc_.context_length = g.context_length;
-    for (const ExpertLayer& e : pack_.experts) {
+    // the grouped kernels take every layer's routed pair: refuse an unsupported pack at load, not at the first token
+    for (int l = 0; l < g.n_layers; ++l) {
+        const ExpertLayer& e = pack_.experts[(size_t) l];
+        if (!basalt::kernels::native_expert_supported(e.gu_type, e.d_type, g.n_embd, g.n_ff_exp)) {
+            err = "layer " + std::to_string(l) + ": no grouped expert kernels for gate/up " +
+                  std::string(basalt::ggml_type_name((uint32_t) e.gu_type)) + " (" + std::to_string(e.gu_type) +
+                  "), down " + std::string(basalt::ggml_type_name((uint32_t) e.d_type)) + " (" + std::to_string(e.d_type) + ")";
+            return false;
+        }
         desc_.expert_gate_up_type.push_back(e.gu_type);
         desc_.expert_down_type.push_back(e.d_type);
     }
@@ -92,7 +102,13 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
+        if (ple_ram) {
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false)) return false;
+        } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) {
+            return false;
+        }
     }
     return true;
 }
@@ -130,7 +146,7 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     s.path = path_;
     s.fd = experts_fd();
     s.range = pack_.experts_range;
-    s.peer_devices = peer_devices_;
+    s.gpus = gpus_;
     s.diag_tier_ram = diag_tier_ram_;
     s.diag_tier_vram = diag_tier_vram_;
     s.diag_tier_frozen = tiers_.diag_tier_frozen;
@@ -152,9 +168,10 @@ core::ExpertTierSpec DsModel::tier_spec() const {
         if (tiers_.vision && !vision_blas().open(err)) return false;
         return prompt_host_.open(*this, 0, sessions(), tiers_.vision, err);
     };
-    s.host.bytes = [this] { return prompt_host_.bytes(); };
+    s.host.bytes = [this] { return prompt_host_.bytes() + (engram_ ? engram_->ram_bytes() : 0); };
     s.host.set_ring = [this](int pieces, std::string& err) { return prompt_host_.set_ring(pieces, err); };
     s.host.ram_only = [this] { warm_token_table(); };
+    s.host_cache_keep = engram_ ? engram_->ram_bytes() : 0;
     return s;
 }
 
@@ -246,8 +263,10 @@ bool DsModel::open_mmproj(vision::Mmproj& mp, std::string& err) const {
 model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads,
                             std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     if (req.paths.empty()) return {model::Status::Error, "deepseek41: no model path"};
+    if (!req.ple_io.empty() && req.ple_io != "direct" && req.ple_io != "ram")
+        return {model::Status::Error, "deepseek41: --ple-io " + req.ple_io + ": direct or ram"};
     std::string err;
-    if (!load(req.paths.front(), reads, err)) return {model::Status::Error, "deepseek41: " + err};
+    if (!load(req.paths.front(), reads, req.ple_io == "ram", err)) return {model::Status::Error, "deepseek41: " + err};
     CacheFormat fmt = CacheFormat::Fp8;
     if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
     set_cache_format(fmt);
@@ -255,21 +274,7 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     set_diag_dump(req.diag_dump);
     set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
     set_tiers(req);
-    std::vector<int> peers = req.peer_devices;
-    if (peers.size() > (size_t) kMaxSecondCards) {
-        basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
-                          kMaxSecondCards);
-        peers.resize((size_t) kMaxSecondCards);
-    }
-    // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
-    // peer card here rather than failing at its first launch with 'no kernel image'.
-    for (int dev : peers) {
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0))
-            return {model::Status::Error, "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
-                                              ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
-    }
-    set_peer_devices(std::move(peers));
+    gpus_ = req.gpus;
     // the sessions first (the drafter takes its memory with the first), then the expert tier, sized from what they leave,
     // opened by the first session; what those share queues its reads in the start's plan
     planning_ = &reads;
@@ -287,7 +292,17 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
 model::Result DsModel::attach(const model::LoadRequest&, std::vector<std::unique_ptr<model::ModelSession>>&) {
     std::string err;
     if (shared_tier_.tier && !shared_tier_.tier->attach(err)) return {model::Status::Error, err};
+    if (engram_ && engram_->ram_bytes() > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engram_->lock_ram();
+        basalt::log::info("basalt deepseek41", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
+                          (double) engram_->ram_bytes() / (1024.0 * 1024.0 * 1024.0),
+                          engram_->locked() ? "locked in RAM" : "loaded (not locked)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     return {};
 }
+
+model::PeerHooks* DsModel::peer() const { return shared_tier_.tier.get(); }
 
 }  // namespace basalt::models::deepseek41

@@ -14,23 +14,23 @@
 
 #include <assert.h>
 #include <immintrin.h>
+#include <math.h>
 
 #if !defined(__AVX2__) || !defined(__F16C__)
 #error "ggml_cpu_dots.c needs AVX2 and F16C"
 #endif
 
-#if defined(_MSC_VER)
-// MSVC gives the scalar F16C pair no working code of its own: the definitions live in
-// f16c_scalar_msvc.c, compiled without __F16C__ so the compiler does not claim the names as its own
-// intrinsics. #pragma function keeps the calls real, and the prototypes keep them from compiling as
-// implicit declarations, which would pass the float as a double.
-#pragma function(_cvtss_sh, _cvtsh_ss)
-unsigned short _cvtss_sh(float a, const int rounding);
-float _cvtsh_ss(unsigned short a);
-#endif
+// The vector F16C intrinsics also give the scalar conversions inline code in the dot loops.
+static inline float ggml_cpu_fp16_to_fp32(unsigned short x) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) x)));
+}
 
-#define GGML_CPU_FP16_TO_FP32(x) _cvtsh_ss(x)
-#define GGML_CPU_FP32_TO_FP16(x) _cvtss_sh(x, 0)
+static inline unsigned short ggml_cpu_fp32_to_fp16(float x) {
+    return (unsigned short) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(x), 0));
+}
+
+#define GGML_CPU_FP16_TO_FP32(x) ggml_cpu_fp16_to_fp32(x)
+#define GGML_CPU_FP32_TO_FP16(x) ggml_cpu_fp32_to_fp16(x)
 #define UNUSED GGML_UNUSED
 
 void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int64_t k);
@@ -190,6 +190,10 @@ static void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRIC
     }
 }
 
+static inline float q8_1_finite_c(float v) {
+    return fabsf(v) > 65504.0f ? copysignf(65504.0f, v) : v;
+}
+
 static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK8_1 == 0);
     const int nb = k / QK8_1;
@@ -203,6 +207,18 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         __m256 v3 = _mm256_loadu_ps( x + 24 );
         x += 32;
 
+        // Preserve NaN in any lane (x86 vmaxps drops a NaN in its first operand).
+        const __m256 nan_mask = _mm256_or_ps(
+            _mm256_cmp_ps( v0, v1, _CMP_UNORD_Q ),
+            _mm256_cmp_ps( v2, v3, _CMP_UNORD_Q ) );
+        if (_mm256_movemask_ps(nan_mask) != 0) {
+            const float qnan = fp32_from_bits(0x7fc00000u);
+            y[i].d = GGML_CPU_FP32_TO_FP16(qnan);
+            y[i].s = GGML_CPU_FP32_TO_FP16(qnan);
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            continue;
+        }
+
         // Compute max(abs(e)) for the block
         const __m256 signBit = _mm256_set1_ps( -0.0f );
         __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
@@ -215,10 +231,13 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
         const float max_scalar = _mm_cvtss_f32( max4 );
 
-        // Quantize these floats
-        const float d = max_scalar / 127.f;
+        // Quantize these floats, keeping fp16 scale and sum finite (matching q8_1_finite.hpp on GPU)
+        const float raw_d = max_scalar / 127.f;
+        const int d_clamped = raw_d > 65504.0f;
+        const float d = d_clamped ? 65504.0f : raw_d;
         y[i].d = GGML_CPU_FP32_TO_FP16(d);
-        const float id = ( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f;
+        float id = d_clamped ? (1.0f / 65504.0f) : (( max_scalar != 0.0f ) ? 127.f / max_scalar : 0.0f);
+        if (!isfinite(id)) id = 0.0f;
         const __m256 mul = _mm256_set1_ps( id );
 
         // Apply the multiplier
@@ -233,6 +252,15 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
         v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
 
+        if (d_clamped) {
+            const __m256 q_min = _mm256_set1_ps( -127.0f );
+            const __m256 q_max = _mm256_set1_ps(  127.0f );
+            v0 = _mm256_min_ps( _mm256_max_ps( v0, q_min ), q_max );
+            v1 = _mm256_min_ps( _mm256_max_ps( v1, q_min ), q_max );
+            v2 = _mm256_min_ps( _mm256_max_ps( v2, q_min ), q_max );
+            v3 = _mm256_min_ps( _mm256_max_ps( v3, q_min ), q_max );
+        }
+
         // Convert floats to integers
         __m256i i0 = _mm256_cvtps_epi32( v0 );
         __m256i i1 = _mm256_cvtps_epi32( v1 );
@@ -240,7 +268,8 @@ static void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRIC
         __m256i i3 = _mm256_cvtps_epi32( v3 );
 
         // Compute the sum of the quants and set y[i].s
-        y[i].s = GGML_CPU_FP32_TO_FP16(d * hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3))));
+        const float sum_f = d * (float) hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
+        y[i].s = GGML_CPU_FP32_TO_FP16(q8_1_finite_c(sum_f));
 
         // Convert int32 to int16
         i0 = _mm256_packs_epi32( i0, i1 );	// 0, 1, 2, 3,  8, 9, 10, 11,  4, 5, 6, 7, 12, 13, 14, 15
@@ -1506,6 +1535,72 @@ static void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+// ggml uses a precomputed table for the E8M0 half scale on x86 (ggml-cpu/simd-mappings.h); the table holds exactly
+// the values of ggml_e8m0_to_fp32_half (ggml-impl.h), so the function is what the table would return, bit for bit.
+#define GGML_CPU_E8M0_TO_FP32_HALF(x) GGML_E8M0_TO_FP32_HALF(x)
+
+// MXFP4 x Q8_0: a 32-value block with one E8M0 scale meets one Q8_0 block (QK_MXFP4 == QK8_0).  Ported from
+// ggml_vec_dot_mxfp4_q8_0 of ggml/src/ggml-cpu/arch/x86/quants.c (the AVX-512 build runs the same AVX2 code there)
+// with the scalar tail of the last block; ggml's scalar fallback (ggml_vec_dot_mxfp4_q8_0_generic, ggml-cpu/
+// quants.c) is extracted as ggml_vec_dot_mxfp4_q8_0_ref in ggml_quants.c.
+static void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP4 == 0);
+    static_assert(QK_MXFP4 == QK8_0, "QK_MXFP4 and QK8_0 must be the same");
+
+    const block_mxfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP4;
+
+    int ib = 0;
+    float sumf = 0;
+
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_mxfp4);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+
+    __m256 accum1 = _mm256_setzero_ps();
+    __m256 accum2 = _mm256_setzero_ps();
+
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
+        const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
+        const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)y[ib + 0].qs);
+        const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+        const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+        const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+        const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
+        const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+        const __m256i p_1 = _mm256_madd_epi16(p16_1, mone);
+        const __m256i p_2 = _mm256_madd_epi16(p16_2, mone);
+        const __m256 scale0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 0].e));
+        const __m256 scale1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 1].e));
+        accum1 = _mm256_fmadd_ps(scale0, _mm256_cvtepi32_ps(p_1), accum1);
+        accum2 = _mm256_fmadd_ps(scale1, _mm256_cvtepi32_ps(p_2), accum2);
+    }
+
+    sumf = hsum_float_8(_mm256_add_ps(accum1, accum2));
+
+    for (; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(y[ib].d)*GGML_CPU_E8M0_TO_FP32_HALF(x[ib].e);
+        int sumi1 = 0;
+        int sumi2 = 0;
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            sumi1 += y[ib].qs[j +          0] * kvalues_mxfp4[x[ib].qs[j] & 0xf];
+            sumi2 += y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
+        }
+        sumf += d * (sumi1 + sumi2);
+    }
+    *s = sumf;
+}
+
 // UE4M3 scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0x7F as 0; bit 7 ignored), built from
 // its bits: exact, and the same as dequantize_row_nvfp4.
 static inline float nvfp4_scale(uint8_t x) {
@@ -1825,12 +1920,12 @@ static inline float mxfp8_ue8m0_to_fp32(uint8_t u) {
     return f;
 }
 
-static void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
+// The scalar row, the table-lookup reference of the vector rows below.  Each sub-block's four lane sums run over
+// j = lane, lane + 4, ... in turn (the products are exact in fp32, so a fused and a separate multiply-add agree),
+// they combine as (l0 + l1) + (l2 + l3), and (fp16 scale * UE8M0 scale) * sum is added to the row sum, sub-block
+// by sub-block.  The build gives it its own name (CMakeLists.txt) so the unit test can call it beside the vector row.
+void ggml_vec_dot_mxfp8_q8_0_scalar(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
+void ggml_vec_dot_mxfp8_q8_0_scalar(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
     assert(n % QK_MXFP8 == 0);
     const block_mxfp8 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
@@ -1848,10 +1943,295 @@ static void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, c
                 d2 += k_mxfp8_e4m3[q[j + 2]] * (float) a[j + 2];
                 d3 += k_mxfp8_e4m3[q[j + 3]] * (float) a[j + 3];
             }
-            sumf += GGML_FP16_TO_FP32(yb->d) * mxfp8_ue8m0_to_fp32(x[ib].d[sb]) * ((d0 + d1) + (d2 + d3));
+            sumf += GGML_CPU_FP16_TO_FP32(yb->d) * mxfp8_ue8m0_to_fp32(x[ib].d[sb]) * ((d0 + d1) + (d2 + d3));
         }
     }
     *s = sumf;
+}
+
+// The vector rows give the scalar row's bits.  An E4M3 code is its fp16 bit pattern shifted,
+// ((c & 0x7F) << 7) | ((c & 0x80) << 8), which is the fp16 of value / 256 (subnormals included), so F16C decodes a
+// vector of weights in one instruction; the 2^8 is exact in the lane sums and is multiplied back in before the scales.  The code 0x7F / 0xFF (E4M3's NaN) is 0 in the table, so its seven low bits are cleared first.
+//
+// The activation of a row set is converted once ("prepped"): per 128 values, 128 floats re-ordered by 32-bit group
+// (four values, one step of the lane sums) so that step t of several sub-blocks is one vector and every sub-block's
+// lane sums add in the scalar order, then the four fp16 scales as floats, padded to MXFP8_PREP_BLOCK floats.  A
+// weight block is decoded once and meets every token's prepped block (up to MXFP8_MAX_TOK): a token's result is
+// the single-token dot's bits whatever the number of tokens.
+#define MXFP8_PREP_BLOCK 144
+#define MXFP8_MAX_TOK 8
+#define MXFP8_MAX_ROWS 4
+
+#if defined(__AVX512BW__) && defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512VBMI__)
+
+static inline __m512i mxfp8_fp16_bits(__m512i w) {
+    return _mm512_or_si512(_mm512_and_si512(_mm512_slli_epi16(w, 8), _mm512_set1_epi16((short) 0x8000)),
+                           _mm512_and_si512(_mm512_slli_epi16(w, 7), _mm512_set1_epi16(0x3F80)));
+}
+
+// two steps of 16 weights each (a step is 16 bytes = 4 sub-blocks x 4 elements) from a block's 128 codes: one byte
+// permute puts step 2s and 2s + 1 in 32 words (the code in the low byte), the shifts make them fp16 bits
+static inline void mxfp8_decode2(__m512i c0, __m512i c1, const uint8_t * idx, __m512 * w) {
+    const __m512i k = _mm512_maskz_permutex2var_epi8((__mmask64) 0x5555555555555555ull, c0, _mm512_loadu_si512((const void *) idx), c1);
+    const __m512i h = mxfp8_fp16_bits(k);
+    w[0] = _mm512_cvtph_ps(_mm512_castsi512_si256(h));
+    w[1] = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(h, 1));
+}
+
+// byte (sub-block sb, step t, element i) is at sb * 32 + 4 * t + i of a block's codes; the word w of the permute for
+// steps 2s and 2s + 1 holds step 2s + w / 16, sub-block (w % 16) / 4, element w % 4 (the odd bytes are zeroed)
+#define MXFP8_E(s, u, sb, i) (sb) * 32 + 4 * (2 * (s) + (u)) + (i), 0
+#define MXFP8_SB(s, u, sb) MXFP8_E(s, u, sb, 0), MXFP8_E(s, u, sb, 1), MXFP8_E(s, u, sb, 2), MXFP8_E(s, u, sb, 3)
+#define MXFP8_HALF(s, u) MXFP8_SB(s, u, 0), MXFP8_SB(s, u, 1), MXFP8_SB(s, u, 2), MXFP8_SB(s, u, 3)
+#define MXFP8_ROW(s) { MXFP8_HALF(s, 0), MXFP8_HALF(s, 1) }
+static _Alignas(64) const uint8_t k_mxfp8_steps[4][64] = {MXFP8_ROW(0), MXFP8_ROW(1), MXFP8_ROW(2), MXFP8_ROW(3)};
+
+// dword (sub-block sb, step t) is at sb * 8 + t of the 32 dwords of a block's four sub-blocks; a vector takes four steps
+static inline __m512i mxfp8_steps_a(void) { return _mm512_setr_epi32(0, 8, 16, 24, 1, 9, 17, 25, 2, 10, 18, 26, 3, 11, 19, 27); }
+static inline __m512i mxfp8_steps_b(void) { return _mm512_setr_epi32(4, 12, 20, 28, 5, 13, 21, 29, 6, 14, 22, 30, 7, 15, 23, 31); }
+
+static inline void mxfp8_prep_block(const block_q8_0 * yb, float * o) {
+    const __m512i q0 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) yb[0].qs)),
+                                          _mm256_loadu_si256((const __m256i *) yb[1].qs), 1);
+    const __m512i q1 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *) yb[2].qs)),
+                                          _mm256_loadu_si256((const __m256i *) yb[3].qs), 1);
+    const __m512i qa = _mm512_permutex2var_epi32(q0, mxfp8_steps_a(), q1);
+    const __m512i qb = _mm512_permutex2var_epi32(q0, mxfp8_steps_b(), q1);
+    _mm512_storeu_ps(o + 0,  _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_castsi512_si128(qa))));
+    _mm512_storeu_ps(o + 16, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(qa, 1))));
+    _mm512_storeu_ps(o + 32, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(qa, 2))));
+    _mm512_storeu_ps(o + 48, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(qa, 3))));
+    _mm512_storeu_ps(o + 64, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_castsi512_si128(qb))));
+    _mm512_storeu_ps(o + 80, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(qb, 1))));
+    _mm512_storeu_ps(o + 96, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(qb, 2))));
+    _mm512_storeu_ps(o + 112, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(qb, 3))));
+    for (int i = 0; i < 4; ++i) o[128 + i] = GGML_CPU_FP16_TO_FP32(yb[i].d);
+}
+
+// `nt` tokens' sums over `nb` blocks of `nr` weight rows (at most MXFP8_MAX_ROWS), added to sumf[r][t].  The rows go
+// through a block together: a token's sum is one chain of adds, four dependent ones a block, so the rows'
+// independent chains fill each other's latency.
+static inline void mxfp8_blocks(const block_mxfp8 * const * xr, int nr, int nb, const float * const * p, int nt, float (*sumf)[MXFP8_MAX_TOK]) {
+    const __m512i k80 = _mm512_set1_epi8((char) 0x80);
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int r = 0; r < nr; ++r) {
+            const block_mxfp8 * x = xr[r] + ib;
+            __m512i c0 = _mm512_loadu_si512((const void *) x->qs);
+            __m512i c1 = _mm512_loadu_si512((const void *) (x->qs + 64));
+            const __mmask64 nan0 = _mm512_cmpeq_epi8_mask(_mm512_or_si512(c0, k80), _mm512_set1_epi8((char) 0xFF));
+            const __mmask64 nan1 = _mm512_cmpeq_epi8_mask(_mm512_or_si512(c1, k80), _mm512_set1_epi8((char) 0xFF));
+            if ((nan0 | nan1) != 0) {   // E4M3's NaN code: the table's 0, sign kept
+                c0 = _mm512_mask_mov_epi8(c0, nan0, _mm512_and_si512(c0, k80));
+                c1 = _mm512_mask_mov_epi8(c1, nan1, _mm512_and_si512(c1, k80));
+            }
+            __m512 w[8];
+            for (int s = 0; s < 4; ++s) mxfp8_decode2(c0, c1, k_mxfp8_steps[s], w + 2 * s);
+            const __m128 ue = _mm_setr_ps(mxfp8_ue8m0_to_fp32(x->d[0]), mxfp8_ue8m0_to_fp32(x->d[1]),
+                                          mxfp8_ue8m0_to_fp32(x->d[2]), mxfp8_ue8m0_to_fp32(x->d[3]));
+            for (int t = 0; t < nt; ++t) {
+                const float * q = p[t] + (size_t) ib * MXFP8_PREP_BLOCK;
+                __m512 acc = _mm512_fmadd_ps(w[0], _mm512_loadu_ps(q), _mm512_setzero_ps());
+                for (int k = 1; k < 8; ++k) acc = _mm512_fmadd_ps(w[k], _mm512_loadu_ps(q + 16 * k), acc);
+                // (l0 + l1) + (l2 + l3) in each group of four lanes, then the 2^8
+                acc = _mm512_add_ps(acc, _mm512_shuffle_ps(acc, acc, 0xB1));
+                acc = _mm512_mul_ps(_mm512_add_ps(acc, _mm512_shuffle_ps(acc, acc, 0x4E)), _mm512_set1_ps(256.0f));
+                // (fp16 scale * UE8M0 scale) * sum of the four sub-blocks as one vector product, then added to the row sum in order
+                const __m128 dv = _mm512_castps512_ps128(_mm512_permutexvar_ps(_mm512_setr_epi32(0, 4, 8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), acc));
+                float term[4];
+                _mm_storeu_ps(term, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(q + 128), ue), dv));
+                float s = sumf[r][t];
+                for (int sb = 0; sb < 4; ++sb) s += term[sb];
+                sumf[r][t] = s;
+            }
+        }
+    }
+}
+
+#else
+
+// 16 codes -> their fp16 bits: the sign-extended code shifted left by 7 has the sign in bit 15, a copy of it in bit 14
+// and the seven low bits in bits 7 to 13; clearing bit 14 leaves the pattern above
+static inline __m256i mxfp8_fp16_bits(__m128i wc) {
+    return _mm256_and_si256(_mm256_slli_epi16(_mm256_cvtepi8_epi16(wc), 7), _mm256_set1_epi16((short) 0xBF80));
+}
+
+// two steps of 8 weights each (a step is 8 bytes = 2 sub-blocks x 4 elements) from 16 bytes of codes
+static inline void mxfp8_decode2(__m128i wc, __m256 * w) {
+    const __m256i h = mxfp8_fp16_bits(wc);
+    w[0] = _mm256_cvtph_ps(_mm256_castsi256_si128(h));
+    w[1] = _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1));
+}
+
+static inline __m256 mxfp8_act8(__m128i q) { return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)); }
+
+static inline void mxfp8_prep_block(const block_q8_0 * yb, float * o) {
+    for (int p = 0; p < 2; ++p) {      // sub-blocks 2p and 2p + 1 share the vectors
+        const __m256i qa = _mm256_loadu_si256((const __m256i *) yb[2 * p].qs);
+        const __m256i qb = _mm256_loadu_si256((const __m256i *) yb[2 * p + 1].qs);
+        // 32-bit groups interleaved: the low halves of ql / qh are steps 0 to 3, the high halves 4 to 7
+        const __m256i ql = _mm256_unpacklo_epi32(qa, qb), qh = _mm256_unpackhi_epi32(qa, qb);
+        float * f = o + 64 * p;
+        _mm256_storeu_ps(f + 0,  mxfp8_act8(_mm256_castsi256_si128(ql)));
+        _mm256_storeu_ps(f + 8,  mxfp8_act8(_mm_srli_si128(_mm256_castsi256_si128(ql), 8)));
+        _mm256_storeu_ps(f + 16, mxfp8_act8(_mm256_castsi256_si128(qh)));
+        _mm256_storeu_ps(f + 24, mxfp8_act8(_mm_srli_si128(_mm256_castsi256_si128(qh), 8)));
+        _mm256_storeu_ps(f + 32, mxfp8_act8(_mm256_extracti128_si256(ql, 1)));
+        _mm256_storeu_ps(f + 40, mxfp8_act8(_mm_srli_si128(_mm256_extracti128_si256(ql, 1), 8)));
+        _mm256_storeu_ps(f + 48, mxfp8_act8(_mm256_extracti128_si256(qh, 1)));
+        _mm256_storeu_ps(f + 56, mxfp8_act8(_mm_srli_si128(_mm256_extracti128_si256(qh, 1), 8)));
+    }
+    for (int i = 0; i < 4; ++i) o[128 + i] = GGML_CPU_FP16_TO_FP32(yb[i].d);
+}
+
+static inline __m256i mxfp8_clear_nan(__m256i c) {
+    const __m256i low7 = _mm256_set1_epi8(0x7F);
+    return _mm256_andnot_si256(_mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(c, low7), low7), low7), c);
+}
+
+// one chain's lane sums (sub-blocks 2pr and 2pr + 1 of block q) -> their two terms: (l0 + l1) + (l2 + l3) in each group
+// of four lanes, the 2^8, then (fp16 scale * UE8M0 scale) * sum as one vector product
+static inline void mxfp8_terms(__m256 acc, const float * q, int pr, __m128 ue2, float * term) {
+    acc = _mm256_add_ps(acc, _mm256_shuffle_ps(acc, acc, 0xB1));
+    acc = _mm256_mul_ps(_mm256_add_ps(acc, _mm256_shuffle_ps(acc, acc, 0x4E)), _mm256_set1_ps(256.0f));
+    const __m128 dv = _mm_unpacklo_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    _mm_storeu_ps(term, _mm_mul_ps(_mm_mul_ps(_mm_castsi128_ps(_mm_loadl_epi64((const __m128i *) (q + 128 + 2 * pr))), ue2), dv));
+}
+
+// `nt` tokens' sums over `nb` blocks of `nr` weight rows (at most MXFP8_MAX_ROWS), added to sumf[r][t].  The rows go
+// through a block together: a token's sum is one chain of adds, four dependent ones a block, so the rows'
+// independent chains fill each other's latency.
+static inline void mxfp8_blocks(const block_mxfp8 * const * xr, int nr, int nb, const float * const * p, int nt, float (*sumf)[MXFP8_MAX_TOK]) {
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int r = 0; r < nr; ++r) {
+            const block_mxfp8 * x = xr[r] + ib;
+            for (int pr = 0; pr < 2; ++pr) {     // sub-blocks 2pr and 2pr + 1 share the vectors
+                const __m128 ue2 = _mm_setr_ps(mxfp8_ue8m0_to_fp32(x->d[2 * pr]), mxfp8_ue8m0_to_fp32(x->d[2 * pr + 1]), 0.0f, 0.0f);
+                const __m256i wa = mxfp8_clear_nan(_mm256_loadu_si256((const __m256i *) (x->qs + 64 * pr)));
+                const __m256i wb = mxfp8_clear_nan(_mm256_loadu_si256((const __m256i *) (x->qs + 64 * pr + 32)));
+                const __m256i wl = _mm256_unpacklo_epi32(wa, wb), wh = _mm256_unpackhi_epi32(wa, wb);
+                __m256 w[8];
+                mxfp8_decode2(_mm256_castsi256_si128(wl), w);
+                mxfp8_decode2(_mm256_castsi256_si128(wh), w + 2);
+                mxfp8_decode2(_mm256_extracti128_si256(wl, 1), w + 4);
+                mxfp8_decode2(_mm256_extracti128_si256(wh, 1), w + 6);
+                for (int t = 0; t < nt; ++t) {
+                    const float * q = p[t] + (size_t) ib * MXFP8_PREP_BLOCK;
+                    __m256 acc = _mm256_fmadd_ps(w[0], _mm256_loadu_ps(q + 64 * pr), _mm256_setzero_ps());
+                    for (int k = 1; k < 8; ++k) acc = _mm256_fmadd_ps(w[k], _mm256_loadu_ps(q + 64 * pr + 8 * k), acc);
+                    float term[4];
+                    mxfp8_terms(acc, q, pr, ue2, term);
+                    sumf[r][t] = (sumf[r][t] + term[0]) + term[1];
+                }
+            }
+        }
+    }
+}
+
+// One token's sums over `nb` blocks of `nr` (1 or 2) rows, added to sumf[r]: each row's two half-blocks are separate
+// chains, so 2 * nr chains run side by side and each weight vector is decoded right before its FMA.  A chain is
+// mxfp8_blocks' chain (the same operations in the same order), and the terms add to the row sum in sub-block order.
+#define MXFP8_ROWS_ONE 2
+static inline void mxfp8_blocks_one(const block_mxfp8 * const * xr, int nr, int nb, const float * p, float * sumf) {
+    const int nc = 2 * nr;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * q = p + (size_t) ib * MXFP8_PREP_BLOCK;
+        __m256i wl[2 * MXFP8_ROWS_ONE], wh[2 * MXFP8_ROWS_ONE];
+        __m256 acc[2 * MXFP8_ROWS_ONE];
+        for (int c = 0; c < nc; ++c) {
+            const uint8_t * qs = xr[c >> 1][ib].qs + 64 * (c & 1);
+            const __m256i wa = mxfp8_clear_nan(_mm256_loadu_si256((const __m256i *) qs));
+            const __m256i wb = mxfp8_clear_nan(_mm256_loadu_si256((const __m256i *) (qs + 32)));
+            wl[c] = _mm256_unpacklo_epi32(wa, wb);
+            wh[c] = _mm256_unpackhi_epi32(wa, wb);
+        }
+        // the low and high lanes of the unpacked codes hold steps 0-1, 2-3 (wl, wh) and 4-5, 6-7 (wl, wh)
+        for (int j = 0; j < 4; ++j) {
+            for (int c = 0; c < nc; ++c) {
+                const __m256i src = (j & 1) ? wh[c] : wl[c];
+                const __m256i h = mxfp8_fp16_bits(j < 2 ? _mm256_castsi256_si128(src) : _mm256_extracti128_si256(src, 1));
+                const float * qc = q + 64 * (c & 1) + 16 * j;
+                const __m256 w0 = _mm256_cvtph_ps(_mm256_castsi256_si128(h)), w1 = _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1));
+                acc[c] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(qc), j == 0 ? _mm256_setzero_ps() : acc[c]);
+                acc[c] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(qc + 8), acc[c]);
+            }
+        }
+        for (int r = 0; r < nr; ++r) {
+            const block_mxfp8 * x = xr[r] + ib;
+            float t0[4], t1[4];
+            mxfp8_terms(acc[2 * r], q, 0, _mm_setr_ps(mxfp8_ue8m0_to_fp32(x->d[0]), mxfp8_ue8m0_to_fp32(x->d[1]), 0.0f, 0.0f), t0);
+            mxfp8_terms(acc[2 * r + 1], q, 1, _mm_setr_ps(mxfp8_ue8m0_to_fp32(x->d[2]), mxfp8_ue8m0_to_fp32(x->d[3]), 0.0f, 0.0f), t1);
+            float s = sumf[r];
+            s = (s + t0[0]) + t0[1];
+            s = (s + t1[0]) + t1[1];
+            sumf[r] = s;
+        }
+    }
+}
+
+#endif
+
+// The prepped activation of one Q8_0 row (n a multiple of 128): n / 128 * MXFP8_PREP_BLOCK floats.
+void ggml_mxfp8_q8_0_prep(int n, const void * GGML_RESTRICT vy, float * GGML_RESTRICT out);
+void ggml_mxfp8_q8_0_prep(int n, const void * GGML_RESTRICT vy, float * GGML_RESTRICT out) {
+    assert(n % QK_MXFP8 == 0);
+    const block_q8_0 * y = vy;
+    for (int ib = 0; ib < n / QK_MXFP8; ++ib) mxfp8_prep_block(y + 4 * ib, out + (size_t) ib * MXFP8_PREP_BLOCK);
+}
+
+// out[t][r] for rows r in [r0, r1) of the weight rows `stride` bytes apart, `nt` <= MXFP8_MAX_TOK prepped activations
+void ggml_mxfp8_q8_0_rows(int n, const void * GGML_RESTRICT vw, size_t stride, const float * const * prep, int nt, float * const * out, int r0, int r1);
+void ggml_mxfp8_q8_0_rows(int n, const void * GGML_RESTRICT vw, size_t stride, const float * const * prep, int nt, float * const * out, int r0, int r1) {
+    assert(n % QK_MXFP8 == 0 && nt <= MXFP8_MAX_TOK);
+#ifdef MXFP8_ROWS_ONE
+    if (nt == 1) {   // one token: rows two at a time through the side-by-side chains
+        for (int r = r0; r < r1; r += MXFP8_ROWS_ONE) {
+            const block_mxfp8 * xr[MXFP8_ROWS_ONE];
+            float sumf[MXFP8_ROWS_ONE] = {0};
+            xr[0] = (const block_mxfp8 *) ((const uint8_t *) vw + (size_t) r * stride);
+            if (r + 1 < r1) {
+                xr[1] = (const block_mxfp8 *) ((const uint8_t *) vw + (size_t) (r + 1) * stride);
+                mxfp8_blocks_one(xr, 2, n / QK_MXFP8, prep[0], sumf);
+                out[0][r + 1] = sumf[1];
+            } else {
+                mxfp8_blocks_one(xr, 1, n / QK_MXFP8, prep[0], sumf);
+            }
+            out[0][r] = sumf[0];
+        }
+        return;
+    }
+#endif
+    for (int r = r0; r < r1; r += MXFP8_MAX_ROWS) {
+        const int nr = r1 - r < MXFP8_MAX_ROWS ? r1 - r : MXFP8_MAX_ROWS;
+        const block_mxfp8 * xr[MXFP8_MAX_ROWS];
+        float sumf[MXFP8_MAX_ROWS][MXFP8_MAX_TOK] = {{0}};
+        for (int k = 0; k < nr; ++k) xr[k] = (const block_mxfp8 *) ((const uint8_t *) vw + (size_t) (r + k) * stride);
+        mxfp8_blocks(xr, nr, n / QK_MXFP8, prep, nt, sumf);
+        for (int k = 0; k < nr; ++k)
+            for (int t = 0; t < nt; ++t) out[t][r + k] = sumf[k][t];
+    }
+}
+
+static void ggml_vec_dot_mxfp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP8 == 0);
+    const block_mxfp8 * x = vx;
+    const block_q8_0 * y = vy;
+    const int nb = n / QK_MXFP8;
+    enum { kChunk = 32 };      // blocks prepped at a time, a stack buffer of 18 KB
+    _Alignas(64) float prep[kChunk * MXFP8_PREP_BLOCK];
+    float sumf[1][MXFP8_MAX_TOK] = {{0}};
+    for (int ib = 0; ib < nb; ib += kChunk) {
+        const int m = nb - ib < kChunk ? nb - ib : kChunk;
+        for (int j = 0; j < m; ++j) mxfp8_prep_block(y + 4 * (ib + j), prep + (size_t) j * MXFP8_PREP_BLOCK);
+        const float * p = prep;
+        const block_mxfp8 * xr = x + ib;
+        mxfp8_blocks(&xr, 1, m, &p, 1, sumf);
+    }
+    *s = sumf[0][0];
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
@@ -1875,6 +2255,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ4_XS]  = {NULL, ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_S]   = {NULL, ggml_vec_dot_iq1_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_MXFP4]   = {NULL, ggml_vec_dot_mxfp4_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_MXFP8]   = {NULL, ggml_vec_dot_mxfp8_q8_0, GGML_TYPE_Q8_0, 1},
 };

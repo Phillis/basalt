@@ -1,5 +1,7 @@
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 #include "basalt/core/spin_wait.hpp"
+#include "basalt/platform/compiler.hpp"
 
 namespace basalt::core {
 
@@ -45,6 +47,13 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
             if (!capture_step(j, err)) return false;
     }
     const Clock::time_point t0 = Clock::now();
+    if (cs_busy_) {
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        cs_busy_ = false;
+    }
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
         h_step_[row * 4 + 0] = (int32_t) cell;
@@ -103,6 +112,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
                 // once the wait yields, since each check then takes a scheduler round trip
                 if ((++spins & (spin.yielding() ? 63u : 1023u)) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
+            basalt::platform::load_fence();   // the token was seen: its probability is read after it
         };
         wait_step(0);
         // every draft arrived: the graph's kernels are done, only its skipped steps' conditional nodes remain
@@ -118,6 +128,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         for (int j = 1; j < max_steps && draft_keep(pr, j - 1, host_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
                 if (cudaGraphLaunch(step_exec_[tier_][j], cs_) != cudaSuccess) {
+                    cs_busy_ = true;
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
@@ -141,9 +152,14 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         decode_gaps().mark(8);
         // the skipped steps' nodes finish beside the next window; the profile stamps and the logits copy need the end
         const bool sync = !arrived || gstamp_ != nullptr || diag_ != nullptr;
-        if (sync && cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
+        if (sync) {
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            cs_busy_ = false;
+        } else {
+            cs_busy_ = true;
         }
     }
     run_launch_hook();   // no graph ran: the hook still runs, once
@@ -152,7 +168,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     decode_gaps().mark(9);
     if (gstamp_ != nullptr) {   // --profile: the GPU's idle time before the round and the draft's span
         unsigned long long st[2] = {0, 0};
-        cudaMemcpy(st, gstamp_, 16, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(st, gstamp_, 16, cudaMemcpyDeviceToHost);
         DecodeGaps& dg = decode_gaps();
         if (dg.verify_end != 0 && st[0] > dg.verify_end && st[1] > st[0]) {
             dg.v2d += (double) (st[0] - dg.verify_end);
@@ -181,6 +197,7 @@ int MtpDrafter::draft_more(int have, int32_t* drafts, float* probs) {
     int n = have;
     for (; n < chain_steps_ && n < kMtpChainMax; ++n) {
         if (((volatile int32_t*) h_out_)[n] < 0) break;
+        basalt::platform::load_fence();
         drafts[n] = ((volatile int32_t*) h_out_)[n];
         if (probs) probs[n] = ((volatile float*) h_prob_)[n];
     }
@@ -221,7 +238,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+        if (basalt::core::device_copy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
                        cudaMemcpyDeviceToDevice) != cudaSuccess) {
             err = "mtp: staging the first residual failed";
             return false;

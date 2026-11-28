@@ -15,10 +15,8 @@
 // and so must every split of a group into runs (a row cap from one expert to none), on two routings with hot experts,
 // with nothing written past the run's rows.  Edge activations: zero sub-blocks
 // next to non-zero ones, tokens scaled by 1e-30 and 1e30, one huge sub-block in a tiny token: finite, zero stays zero,
-// and the gate/up product follows the A4 reference.  Then a microbench line (--no-bench skips it).  With a second
-// device, the peer card's share of a streamed chunk (its experts' rows in pieces of a row cap, each group planned on
-// its own copy of the activations) must equal the primary's whole-layer rows bit for bit, at 512 experts and top 10,
-// with a timing line for the peer.  Exit 77 without a CUDA device.
+// and the gate/up product follows the A4 reference.  Then a microbench line (--no-bench skips it).  Exit 77 without a
+// CUDA device.
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
@@ -109,24 +107,23 @@ float f16(float v) { return ggml_fp16_to_fp32(ggml_fp32_to_fp16(v)); }
 // the FP4 activation rounding (quantize_kernel in moe_fp4.cu): token scale g = amax / (6 * 448), per 16 values a UE4M3
 // scale of block amax / (6 g), codes rounded to nearest even on x / (scale * g)
 float e4m3_round(float v) {
-    static float tab[127];
-    static bool init = false;
-    if (!init) {
+    static const std::array<float, 127> tab = [] {
+        std::array<float, 127> t{};
         for (int c = 0; c < 127; ++c) {
             const int e = c >> 3, m = c & 7;
-            tab[c] = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
+            t[(size_t) c] = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
         }
-        init = true;
-    }
+        return t;
+    }();
     if (!(v > 0.0f)) return 0.0f;
     if (v >= 448.0f) return 448.0f;
     int lo = 0, hi = 126;   // the largest code at or below v
     while (hi > lo) {
         const int mid = (lo + hi + 1) >> 1;
-        if (tab[mid] <= v) lo = mid; else hi = mid - 1;
+        if (tab[(size_t) mid] <= v) lo = mid; else hi = mid - 1;
     }
-    if (lo == 126) return tab[lo];
-    const float a = tab[lo], b = tab[lo + 1], mid = 0.5f * (a + b);
+    if (lo == 126) return tab[(size_t) lo];
+    const float a = tab[(size_t) lo], b = tab[(size_t) (lo + 1)], mid = 0.5f * (a + b);
     return v < mid ? a : v > mid ? b : (lo & 1 ? b : a);
 }
 float e2m1_round(float v) {
@@ -446,10 +443,10 @@ bool split_equivalence(const char* name, const Layer& L, const float* x_dev, con
     const int64_t rows = (int64_t) L.T * K;
     const size_t n = L.order.size(), groups = (n + GROUP - 1) / GROUP;
     Dev src_dev((size_t) rows * 4);
-    ck(cudaMemcpy(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice), "src");
+    ck(cudaMemcpyAsync(src_dev.p, L.src.data(), L.src.size() * 4, cudaMemcpyHostToDevice, s), "src");
     Bufs b(rows, L.bh.size());
     F4 f(rows, n);
-    ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+    ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "clr");
     run_fp4(f, b, L, x_dev, src_dev.as<int32_t>(), blob, s);
     ck(cudaStreamSynchronize(s), "sync abs");
     const std::vector<float> ref = download(b.dm, (size_t) rows * N);
@@ -459,7 +456,7 @@ bool split_equivalence(const char* name, const Layer& L, const float* x_dev, con
     int runs_unsplit = 0, runs_small = 0;
     for (int64_t cap : {(int64_t) 1 << 40, (int64_t) 2 * 64 + 1, (int64_t) 65, maxcnt, (int64_t) 1}) {
         F4Run r(std::min<int64_t>(rows, std::max(cap, maxcnt)));
-        ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+        ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "clr");
         bool guards = true;
         const int runs = run_fp4_group(f, r, b, L, x_dev, src_dev.as<int32_t>(), blob, cap, guards, s);
         const std::vector<float> y = download(b.dm, (size_t) rows * N);
@@ -502,15 +499,15 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         t7[c] = c == 1234 ? 1e-30f : 0.0f;
     }
     Dev x_dev((size_t) R * N * 4);
-    ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    ck(cudaMemcpyAsync(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice, s), "x");
     const int32_t bounds[2] = {0, R};
     Dev bd(8);
-    ck(cudaMemcpy(bd.p, bounds, 8, cudaMemcpyHostToDevice), "bounds");
+    ck(cudaMemcpyAsync(bd.p, bounds, 8, cudaMemcpyHostToDevice, s), "bounds");
     F4 f(R, 1);
     fp4::plan(bd.as<int32_t>(), 1, f.tox.as<int32_t>(), s);
     fp4::quantize(x_dev.as<float>(), nullptr, bd.as<int32_t>(), f.tox.as<int32_t>(), 1, f.a4x.p, f.gsx.as<float>(), N, N, R, s);
     Dev gu((size_t) R * 1280 * 4);
-    ck(cudaMemset(gu.p, 0xff, gu.bytes), "clr");
+    ck(cudaMemsetAsync(gu.p, 0xff, gu.bytes, s), "clr");
     fp4::Product p;
     p.blob[0] = blob[0];
     p.w_off = 0; p.w_rows = 1280; p.w_cols = N; p.n = 1;
@@ -552,7 +549,7 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         std::vector<float> xk((size_t) RK * N);
         for (int i = 0; i < RK; ++i) std::memcpy(xk.data() + (size_t) i * N, x.data() + (size_t) keep[i] * N, N * 4);
         Dev xk_dev(xk.size() * 4);
-        ck(cudaMemcpy(xk_dev.p, xk.data(), xk.size() * 4, cudaMemcpyHostToDevice), "x");
+        ck(cudaMemcpyAsync(xk_dev.p, xk.data(), xk.size() * 4, cudaMemcpyHostToDevice, s), "x");
         Layer L;
         L.T = RK;
         L.E = 1;
@@ -564,12 +561,12 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         L.bh = {0, RK, 0, RK};
         // rows = T * K in the helpers: this layer has RK rows, so describe it with K = 1 rows by hand
         Dev src_dev((size_t) RK * 4), bdev(L.bh.size() * 4), dm((size_t) RK * N * 4);
-        ck(cudaMemcpy(src_dev.p, L.src.data(), RK * 4, cudaMemcpyHostToDevice), "src");
-        ck(cudaMemcpy(bdev.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice), "bounds");
+        ck(cudaMemcpyAsync(src_dev.p, L.src.data(), RK * 4, cudaMemcpyHostToDevice, s), "src");
+        ck(cudaMemcpyAsync(bdev.p, L.bh.data(), L.bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
         F4 fk(RK, 1);
         fp4::quantize_tokens(xk_dev.as<float>(), RK, N, N, fk.a4x.p, fk.gsx.as<float>(), s);
         F4Run r(RK);
-        ck(cudaMemset(dm.p, 0xff, dm.bytes), "clr");
+        ck(cudaMemsetAsync(dm.p, 0xff, dm.bytes, s), "clr");
         fp4::Group g;
         g.n = 1;
         g.blob[0] = blob[0];
@@ -599,223 +596,6 @@ bool edge_activations(const std::vector<std::vector<uint8_t>>& host, const std::
         }
     }
     return ok;
-}
-
-// The streamed walk's FP4 sequence on the current device: the experts `order` (absolute row bounds `bh`, n + 1, rows
-// laid out by `src`: row -> token) over the `T` tokens' activations rounded once, then run in groups of GROUP experts.
-std::vector<float> primary_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
-                                const float* x_dev, int64_t T, const std::vector<int32_t>& src,
-                                const std::vector<const uint8_t*>& blob, int64_t row_cap, cudaStream_t s) {
-    const int n = (int) order.size();
-    int64_t maxcnt = 0;
-    for (int j = 0; j < n; ++j) maxcnt = std::max<int64_t>(maxcnt, bh[(size_t) j + 1] - bh[(size_t) j]);
-    const int64_t gr = std::min(rows, std::max(row_cap, maxcnt));   // GU and H hold a run's rows
-    Dev src_dev(src.size() * 4 + 4), bd((size_t) (n + 1) * 4), a4x(fp4::token_bytes(T, N)),
-        gsx((size_t) T * 4),
-        h((size_t) gr * FF * 4), a4h(fp4::a4_bytes(gr, FF, GROUP)), gsh(fp4::scale_count(gr, GROUP) * 4),
-        th(2 * (GROUP + 1) * 4), dm((size_t) rows * N * 4);
-    ck(cudaMemcpy(src_dev.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
-    ck(cudaMemcpy(bd.p, bh.data(), (size_t) (n + 1) * 4, cudaMemcpyHostToDevice), "bounds");
-    ck(cudaMemset(dm.p, 0xff, dm.bytes), "clr");
-    fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
-    for (int j0 = 0; j0 < n; j0 += GROUP) {
-        fp4::Group g;
-        g.n = std::min(GROUP, n - j0);
-        for (int q = 0; q < g.n; ++q) g.blob[q] = blob[(size_t) order[(size_t) (j0 + q)]];
-        g.bounds_host = bh.data() + j0;
-        g.bounds_dev = bd.as<int32_t>() + j0;
-        g.ids = src_dev.as<int32_t>(); g.a4x = a4x.p; g.gsx = gsx.as<float>(); g.tokens = T;
-        g.down_off = DOWN_OFF; g.tail_off = TAIL_OFF;
-        g.h = h.as<float>(); g.dm = dm.as<float>();
-        g.a4h = a4h.p; g.gsh = gsh.as<float>(); g.toh = th.as<int32_t>(); g.rel = g.toh + (GROUP + 1);
-        fp4::run_group(g, row_cap, s);
-    }
-    ck(cudaStreamSynchronize(s), "sync primary rows");
-    return download(dm, (size_t) rows * N);
-}
-
-// The peer card's sequence (peer_experts.cpp, no direct access between the cards): its experts `order` (bounds `bh`
-// relative to its block, rows laid out by `src`) in pieces of at most `cap` rows (fp4::cut_pieces), from the `T`
-// tokens' activations rounded once, into buffers of `cap` rows.  `ms`: the compute alone, timed again.
-std::vector<float> peer_rows(const std::vector<int32_t>& order, const std::vector<int32_t>& bh, int64_t rows,
-                             const float* x_dev, int64_t T, const std::vector<int32_t>& src,
-                             const std::vector<const uint8_t*>& blob, int64_t cap, cudaStream_t s, float& ms,
-                             int& npieces, int& ngroups) {
-    fp4::Pieces pc;
-    fp4::cut_pieces(bh.data(), (int) order.size(), cap, pc);
-    ngroups = (int) pc.group.size() - 1;
-    npieces = (int) pc.expert.size();
-    std::vector<int32_t> rel;
-    std::vector<size_t> rel_at;
-    for (int g = 0; g < ngroups; ++g) {
-        rel_at.push_back(rel.size());
-        for (int i = pc.group[(size_t) g]; i <= pc.group[(size_t) g + 1]; ++i)
-            rel.push_back(pc.bounds[(size_t) i] - pc.bounds[(size_t) pc.group[(size_t) g]]);
-    }
-    Dev src_dev(src.size() * 4 + 4), rd(rel.size() * 4 + 4), a4x(fp4::token_bytes(T, N)), gsx((size_t) T * 4),
-        h((size_t) cap * FF * 4), a4h(fp4::a4_bytes(cap, FF, GROUP)), gsh(fp4::scale_count(cap, GROUP) * 4),
-        th(2 * (GROUP + 1) * 4), dm((size_t) cap * N * 4);
-    ck(cudaMemcpy(src_dev.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
-    ck(cudaMemcpy(rd.p, rel.data(), rel.size() * 4, cudaMemcpyHostToDevice), "bounds");
-    std::vector<float> out((size_t) rows * N);
-    fp4::quantize_tokens(x_dev, T, N, N, a4x.p, gsx.as<float>(), s);
-    auto group = [&](int g) {
-        const int p0 = pc.group[(size_t) g], ns = pc.group[(size_t) g + 1] - p0;
-        const int64_t r0 = pc.bounds[(size_t) p0], nr = pc.bounds[(size_t) p0 + ns] - r0;
-        const int32_t* rb = rd.as<int32_t>() + rel_at[(size_t) g];
-        fp4::Group fg;
-        fg.n = ns;
-        for (int i = 0; i < ns; ++i) fg.blob[i] = blob[(size_t) order[(size_t) pc.expert[(size_t) (p0 + i)]]];
-        fg.bounds_host = rel.data() + rel_at[(size_t) g];
-        fg.bounds_dev = rb;
-        fg.ids = src_dev.as<int32_t>() + r0; fg.a4x = a4x.p; fg.gsx = gsx.as<float>(); fg.tokens = T;
-        fg.down_off = DOWN_OFF; fg.tail_off = TAIL_OFF;
-        fg.h = h.as<float>(); fg.dm = dm.as<float>();
-        fg.a4h = a4h.p; fg.gsh = gsh.as<float>(); fg.toh = th.as<int32_t>(); fg.rel = fg.toh + (GROUP + 1);
-        if (fp4::run_group(fg, cap, s) != 1) throw std::runtime_error("a peer group took more than one run");
-        return std::make_pair(r0, nr);
-    };
-    for (int g = 0; g < ngroups; ++g) {
-        ck(cudaMemsetAsync(dm.p, 0xff, dm.bytes, s), "clr");
-        const auto [r0, nr] = group(g);
-        ck(cudaMemcpyAsync(out.data() + (size_t) r0 * N, dm.p, (size_t) nr * N * 4, cudaMemcpyDeviceToHost, s), "rows");
-        ck(cudaStreamSynchronize(s), "sync peer group");
-    }
-    cudaEvent_t e0, e1;
-    ck(cudaEventCreate(&e0), "event");
-    ck(cudaEventCreate(&e1), "event");
-    ck(cudaEventRecord(e0, s), "record");
-    for (int g = 0; g < ngroups; ++g) group(g);
-    ck(cudaEventRecord(e1, s), "record");
-    ck(cudaEventSynchronize(e1), "sync timing");
-    ck(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    return out;
-}
-
-// The peer card's share of a streamed chunk: every row of the experts it holds, computed there in pieces, and every
-// row of the primary's own experts, computed without them, must equal bit for bit the row the primary computes when it
-// runs the whole layer (the streamed walk without the peer).  Real geometry: 512 experts, top 10.
-struct PeerShape { int T, hot; int64_t cap; };
-bool peer_share(int d0, int d1, const PeerShape& sh, const std::vector<const uint8_t*>& blob0,
-                const std::vector<const uint8_t*>& blob1, std::mt19937& rng) {
-    constexpr int E = 512;
-    const int T = sh.T;
-    const Layer L = route(T, E, rng, sh.hot);
-    const int64_t rows = (int64_t) T * K;
-    std::vector<float> x((size_t) T * N);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    for (float& v : x) v = nd(rng) * (rng() % 200 == 0 ? 12.0f : 1.0f);
-    // the peer's experts: every fourth, and expert 0 (hot when the routing has hot experts)
-    std::vector<char> on_peer((size_t) E, 0);
-    for (int e = 0; e < E; ++e) on_peer[(size_t) e] = e % 4 == 1 || e == 0;
-    // peer_experts.cpp's layout with a peer: the primary's experts first, then the peer's block, each in id order
-    std::vector<int32_t> off2((size_t) E, 0), order_l, order_p, bh_l, bh_p;
-    int32_t r = 0;
-    for (int pass = 0; pass < 2; ++pass)
-        for (int e = 0; e < E; ++e) {
-            if ((bool) on_peer[(size_t) e] != (pass == 1)) continue;
-            off2[(size_t) e] = r;
-            if (L.cnt[(size_t) e] > 0) (pass ? order_p : order_l).push_back(e);
-            r += L.cnt[(size_t) e];
-        }
-    const int64_t rows_local = [&] {
-        int64_t n = 0;
-        for (int e = 0; e < E; ++e) if (!on_peer[(size_t) e]) n += L.cnt[(size_t) e];
-        return n;
-    }();
-    std::vector<int32_t> src2((size_t) rows);
-    for (int e = 0; e < E; ++e)
-        for (int q = 0; q < L.cnt[(size_t) e]; ++q) src2[(size_t) (off2[(size_t) e] + q)] = L.src[(size_t) (L.off[(size_t) e] + q)];
-    for (int32_t e : order_l) bh_l.push_back(off2[(size_t) e]);
-    bh_l.push_back((int32_t) rows_local);
-    for (int32_t e : order_p) bh_p.push_back(off2[(size_t) e] - (int32_t) rows_local);
-    bh_p.push_back((int32_t) (rows - rows_local));
-    std::vector<int32_t> bh_all;
-    for (int32_t e : L.order) bh_all.push_back(L.off[(size_t) e]);
-    bh_all.push_back((int32_t) rows);
-    const int64_t row_cap = std::min<int64_t>(rows, std::max<int64_t>(T, (int64_t) 1023 * K));   // group_rows_cap
-    // the primary: the whole layer, then its own experts alone
-    ck(cudaSetDevice(d0), "device 0");
-    cudaStream_t s0;
-    ck(cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking), "stream");
-    std::vector<float> ref, loc;
-    {
-        Dev x0(x.size() * 4);
-        ck(cudaMemcpy(x0.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-        ref = primary_rows(L.order, bh_all, rows, x0.as<float>(), sh.T, L.src, blob0, row_cap, s0);
-        const std::vector<int32_t> src_l(src2.begin(), src2.begin() + rows_local);
-        loc = primary_rows(order_l, bh_l, rows_local, x0.as<float>(), sh.T, src_l, blob0, row_cap, s0);
-    }
-    cudaStreamDestroy(s0);
-    // the peer: its own copy of the activations (the same bytes, through the host)
-    ck(cudaSetDevice(d1), "device 1");
-    cudaStream_t s1;
-    ck(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking), "stream");
-    std::vector<float> per;
-    float ms = 0;
-    int npieces = 0, ngroups = 0;
-    {
-        Dev x1(x.size() * 4);
-        ck(cudaMemcpy(x1.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
-        const std::vector<int32_t> src_p(src2.begin() + rows_local, src2.end());
-        per = peer_rows(order_p, bh_p, rows - rows_local, x1.as<float>(), sh.T, src_p, blob1, sh.cap, s1, ms, npieces, ngroups);
-    }
-    cudaStreamDestroy(s1);
-    ck(cudaSetDevice(d0), "device 0");
-    int64_t bad = 0, maxcnt_p = 0;
-    for (int32_t e : order_p) maxcnt_p = std::max<int64_t>(maxcnt_p, L.cnt[(size_t) e]);
-    for (int e = 0; e < E; ++e)
-        for (int q = 0; q < L.cnt[(size_t) e]; ++q) {
-            const float* a = ref.data() + (size_t) (L.off[(size_t) e] + q) * N;
-            const int64_t r2 = off2[(size_t) e] + q;
-            const float* b = on_peer[(size_t) e] ? per.data() + (size_t) (r2 - rows_local) * N : loc.data() + (size_t) r2 * N;
-            bad += std::memcmp(a, b, (size_t) N * 4) != 0;
-        }
-    const int64_t rows_p = rows - rows_local;
-    const double flop = 2.0 * (double) rows_p * (1280.0 * N + (double) N * FF);
-    std::printf("  peer share, %d tokens (%s routing), cap %lld: the peer's %zu experts hold %lld of %lld rows (%.1f%%, "
-                "largest %lld) in %d pieces / %d groups; bitwise equal to the primary's whole layer: %s (%lld rows differ)\n",
-                T, sh.hot ? "hot" : "even", (long long) sh.cap, order_p.size(), (long long) rows_p, (long long) rows,
-                100.0 * (double) rows_p / (double) rows, (long long) maxcnt_p, npieces, ngroups, bad == 0 ? "yes" : "NO",
-                (long long) bad);
-    std::printf("  bench: peer share on device %d: %lld rows in %.2f ms (%.1f TFLOP/s)\n", d1, (long long) rows_p, ms,
-                flop / (ms * 1e-3) * 1e-12);
-    return bad == 0;
-}
-
-int peer_parity(int d0, int d1) {
-    std::printf("peer share: device %d computes its experts' rows for device %d\n", d1, d0);
-    std::mt19937 rng(5150);
-    constexpr int NB = 16;   // distinct blobs, expert e takes blob e % NB
-    std::vector<std::vector<uint8_t>> host((size_t) NB);
-    float t3[3];
-    for (int i = 0; i < NB; ++i) host[(size_t) i] = make_blob(rng, t3);
-    std::vector<std::unique_ptr<Dev>> keep;
-    std::vector<const uint8_t*> b0(512), b1(512);
-    for (int d : {d0, d1}) {
-        ck(cudaSetDevice(d), "device");
-        std::vector<const uint8_t*> dist((size_t) NB);
-        for (int i = 0; i < NB; ++i) {
-            keep.push_back(std::make_unique<Dev>(BYTES));
-            ck(cudaMemcpy(keep.back()->p, host[(size_t) i].data(), BYTES, cudaMemcpyHostToDevice), "blob");
-            dist[(size_t) i] = keep.back()->as<uint8_t>();
-        }
-        for (int e = 0; e < 512; ++e) (d == d0 ? b0 : b1)[(size_t) e] = dist[(size_t) (e % NB)];
-    }
-    bool ok = true;
-    for (const PeerShape& sh : {PeerShape{2600, 0, 2559}, PeerShape{4806, 2, 2559}, PeerShape{4806, 0, 1000},
-                                PeerShape{1100, 5, 64}})
-        ok &= peer_share(d0, d1, sh, b0, b1, rng);
-    // the blobs are freed on their own devices
-    for (size_t i = 0; i < keep.size(); ++i) {
-        ck(cudaSetDevice(i < (size_t) NB ? d0 : d1), "device");
-        keep[i].reset();
-    }
-    ck(cudaSetDevice(d0), "device 0");
-    std::printf("peer share: %s\n", ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
 }
 
 int parity(cudaStream_t s) {
@@ -849,15 +629,14 @@ int parity(cudaStream_t s) {
     run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, false, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y1 = download(b.dm, (size_t) rows * N);
-    ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");
-    ck(cudaMemset(b.scales(), 0xff, GROUP * 16), "sentinel");
-    ck(cudaDeviceSynchronize(), "sentinel");
+    ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "sentinel");
+    ck(cudaMemsetAsync(b.scales(), 0xff, GROUP * 16, s), "sentinel");
     run_mmq(ctx, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, true, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y = download(b.dm, (size_t) rows * N), ygu = download(b.gu, (size_t) rows * 1280);
     F4 f4(rows, L.order.size());
-    ck(cudaMemset(b.dm.p, 0, (size_t) rows * N * 4), "clr");
-    ck(cudaMemset(b.gu.p, 0, (size_t) rows * 1280 * 4), "clr");
+    ck(cudaMemsetAsync(b.dm.p, 0, (size_t) rows * N * 4, s), "clr");
+    ck(cudaMemsetAsync(b.gu.p, 0, (size_t) rows * 1280 * 4, s), "clr");
     run_fp4(f4, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, s);
     ck(cudaStreamSynchronize(s), "sync fp4");
     const std::vector<float> fy = download(b.dm, (size_t) rows * N), fgu = download(b.gu, (size_t) rows * 1280),
@@ -866,7 +645,7 @@ int parity(cudaStream_t s) {
     // the production gate/up: token planes, SwiGLU in the epilogue; H must be the plain product + mmq::swiglu's bits
     const bool planes_ok = token_planes_match(f4, L, x_dev.as<float>(), src_dev.as<int32_t>(), s);
     Dev hf_dev((size_t) rows * FF * 4);
-    ck(cudaMemset(hf_dev.p, 0xff, hf_dev.bytes), "clr");
+    ck(cudaMemsetAsync(hf_dev.p, 0xff, hf_dev.bytes, s), "clr");
     run_fused_h(f4, b, L, x_dev.as<float>(), src_dev.as<int32_t>(), blob, hf_dev.as<float>(), s);
     ck(cudaStreamSynchronize(s), "sync fused");
     const std::vector<float> hf = download(hf_dev, (size_t) rows * FF);
@@ -992,8 +771,8 @@ int parity(cudaStream_t s) {
         Layer L2 = L;
         for (int e = 0; e < E; ++e) std::reverse(L2.src.begin() + L.off[(size_t) e], L2.src.begin() + L.off[(size_t) e + 1]);
         Dev src2((size_t) rows * 4);
-        ck(cudaMemcpy(src2.p, L2.src.data(), L2.src.size() * 4, cudaMemcpyHostToDevice), "src2");
-        ck(cudaMemset(b.dm.p, 0xff, (size_t) rows * N * 4), "clr");
+        ck(cudaMemcpyAsync(src2.p, L2.src.data(), L2.src.size() * 4, cudaMemcpyHostToDevice, s), "src2");
+        ck(cudaMemsetAsync(b.dm.p, 0xff, (size_t) rows * N * 4, s), "clr");
         run_fp4(f4, b, L2, x_dev.as<float>(), src2.as<int32_t>(), blob, s);
         ck(cudaStreamSynchronize(s), "sync fp4 reversed");
         const std::vector<float> ry = download(b.dm, (size_t) rows * N);
@@ -1150,8 +929,6 @@ int main(int argc, char** argv) {
             cudaStreamDestroy(s2);
         }
         ck(cudaSetDevice(0), "set device");
-        if (rc == 0 && ndev >= 2) rc = peer_parity(0, 1);
-        else if (ndev < 2) std::printf("peer share: one device, skipped\n");
         return rc;
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "prefill_mmq_nvfp4_test: %s\n", ex.what());

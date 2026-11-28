@@ -40,9 +40,14 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--diag-dump") o.diag_dump = next("--diag-dump");
         else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
+        else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
         else if (a == "--diag-serial-prompt") o.diag_serial_prompt = true;
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--diag-batch-check") o.diag_batch_check = true;
+        else if (a == "--diag-gpu-check") o.diag_gpu_check = true;
+        else if (a == "--diag-gpu-same") o.diag_gpu_same = true;
+        else if (a == "--diag-gpu-trace") o.diag_gpu_trace = next("--diag-gpu-trace");
+        else if (a == "--diag-gpu-ref") o.diag_gpu_ref = next("--diag-gpu-ref");
         else if (a == "--image") o.images.push_back(next("--image"));
         else if (a == "--image-at") o.image_at.push_back(std::atoll(next("--image-at")));
         else if (a == "--image-pad-id") { o.image_pad_id = std::atoll(next("--image-pad-id")); o.image_pad_given = true; }
@@ -71,7 +76,10 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--gpu-mode") o.gpu_mode = next("--gpu-mode");
+        else if (a == "--gpu-share") o.gpu_share = next("--gpu-share");
         else if (a == "--gpu-plan") o.gpu_plan = true;
+        else if (a == "--diag-gpu-cut") o.diag_gpu_cut = std::atoi(next("--diag-gpu-cut"));
         else if (a == "--ppl-base") o.ppl_base = next("--ppl-base");
         else if (a == "--ppl-out") o.ppl_out = next("--ppl-out");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
@@ -82,6 +90,11 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             if (v != "on" && v != "off") { basalt::log::error("basalt", "--grammar: on or off"); return 2; }
             o.grammar = v == "on";
         }
+        else if (a == "--kv-pool") {
+            const std::string v = next("--kv-pool");
+            if (v != "on" && v != "off") { basalt::log::error("basalt", "--kv-pool: on or off"); return 2; }
+            o.kv_pool = v == "on";
+        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") { o.vision = true; o.vision_in_engine = true; }
@@ -90,7 +103,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-disk-mib" ||
-                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib") {
+                 a == "--conversation-cache-min-tokens" || a == "--ram-reserve-mib" || a == "--checkpoint-pool-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -105,6 +118,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = (int) number;
             else if (a == "--ram-reserve-mib") o.ram_reserve_mib = number;
+            else if (a == "--checkpoint-pool-mib") o.checkpoint_pool_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -142,6 +156,10 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         basalt::log::warn("basalt", "RAM guard off (--ram-reserve-mib 0): low RAM can stop the engine or the machine");
     if (adapter != nullptr)
         if (const std::optional<int> code = adapter->finish_flags(o)) return code;
+    if (adapter != nullptr && o.batch > adapter->max_slots()) {
+        basalt::log::error("basalt", "--batch %d: %s batches at most %d slots", o.batch, adapter->arch(), adapter->max_slots());
+        return 2;
+    }
     if (!o.lossy.empty()) {
         basalt::log::warn("basalt", "lossy flags enabled, these flags will affect the accuracy of the served model");
         for (const auto& f : o.lossy) basalt::log::warn("basalt", "%s", f.effect.c_str());

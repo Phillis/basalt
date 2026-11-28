@@ -72,7 +72,7 @@ bool Verifier::WindowRecorder::inputs() {
     // residual, pending write and inject (see set_stage)
     if (v_.lb_ > 0) {
         if (!v_.batch_rec_) wait_flag_ge(v_.m_flag_ + 12, 1, cs);   // the previous stage's graph raised it after its hand-off
-        const float* hin = v_.hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
+        const float* hin = v_.hand_in_;   // the window's rows: [R][bo][inj] contiguous
         copy_from_mapped(v_.R_, hin, (int64_t) T * HC * N, cs);
         copy_from_mapped(v_.bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
         copy_from_mapped(v_.inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
@@ -108,7 +108,7 @@ bool Verifier::WindowRecorder::inputs() {
     // a lazy GDN layer: one after the stage's first, in a solo window (lazy_on)
     gdn_first = -1;
     for (int64_t l = v_.lb_; l < v_.le_ && gdn_first < 0; ++l) gdn_first = gdn_idx[(size_t) l];
-    lazy = v_.lazy_on() && !v_.batch_rec_ && cs == v_.cs_ && dm;
+    lazy = v_.lazy_on() && !v_.batch_rec_ && !v_.prof_on_ && cs == v_.cs_ && dm;
     lazy_args = lazy ? v_.commit_gdn_lazy_args() : GdnCommitLayers{};
     lz_open = false;
     return true;

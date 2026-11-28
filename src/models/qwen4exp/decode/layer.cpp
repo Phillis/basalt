@@ -1,5 +1,6 @@
 
 // src/models/qwen4exp/decode/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
@@ -613,6 +614,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
             cudaSuccess) {
+        qsa_state_release(st);
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
@@ -624,6 +626,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         uint8_t* d = nullptr;
         if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+            if (h != nullptr) cudaFreeHost(h);
+            qsa_state_release(st);
             // the driver may pin only a small amount of host memory in all, which is less than a long context of
             // 8-bit KV needs
             if (p.mode == 1) basalt::log::error("basalt", "KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
@@ -631,6 +635,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
+        st.host_pinned = h;
         g_kv_host_bytes += bytes;
         Cursor hc{d};
         if (st.kv_q4) {
@@ -655,8 +660,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
             basalt::kernels::build_rope_table((int) s.n_rot, basalt::kernels::rope_scaling(), (int) max_cells,
                                               hc.data(), hs.data());
-            cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+            basalt::core::device_copy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
         }
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp)
@@ -667,7 +672,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
-        cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
     } else if (p.mode == 1) {
         basalt::kernels::kv_stream_reset(st.map, nullptr);
     } else {
@@ -683,6 +688,13 @@ int64_t qsa_kv_elastic() { return g_kv_elastic; }
 void qsa_state_release(QsaState& st) {
     delete st.kv_arena;
     st.kv_arena = nullptr;
+    if (st.host_step != nullptr) { cudaFreeHost(st.host_step); st.host_step = nullptr; }
+    if (st.host_pos != nullptr) { cudaFreeHost(st.host_pos); st.host_pos = nullptr; }
+    if (st.host_pinned != nullptr) {
+        cudaFreeHost(st.host_pinned);
+        st.host_pinned = nullptr;
+        st.host = basalt::kernels::KvHostPools{};
+    }
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {

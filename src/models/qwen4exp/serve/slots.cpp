@@ -49,11 +49,8 @@ bool QfnRuntime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::strin
             !basalt::core::conversation_checkpoint_restore(ck, to, g, e))
             return false;
         for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-            basalt::core::ConversationKv img;
-            if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
-                return false;
-            if (!sync_device("batch admission: device sync failed", e)) return false;
-            if (!basalt::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+            if (!basalt::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                    to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                 return false;
         }
         if (!sync_device("batch admission: device sync failed", e)) return false;
@@ -137,44 +134,6 @@ void QfnRuntime::solo_draft_back(bool keep) {
     std::string e;
     if (keep && live_ok && !live.empty() && !mtp.copy_store(0, mtp.main_store(), (int64_t) live.size(), e))
         basalt::log::warn("basalt serve", "the solo conversation's draft K/V: %s", e.c_str());
-}
-
-// hashes of everything slot b's sessions hold for its first `upto` tokens, per part (GDN state, PLE history,
-// indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
-// window against another run of the same request
-bool QfnRuntime::slot_digest(int b, int64_t upto, uint64_t* part) {
-    for (int i = 0; i < 10; ++i) part[i] = 1469598103934665603ull;
-    auto mix = [&](int i, const uint8_t* p, size_t n) {
-        uint64_t h = part[i];
-        size_t k = 0;
-        for (; k + 8 <= n; k += 8) {
-            uint64_t w;
-            std::memcpy(&w, p + k, 8);
-            h = (h ^ w) * 1099511628211ull;
-            h ^= h >> 29;
-        }
-        for (; k < n; ++k) h = (h ^ p[k]) * 1099511628211ull;
-        part[i] = h;
-    };
-    std::string e;
-    const basalt::core::SessionState& from = *bslot_ss[0][(size_t) b];
-    if (cudaDeviceSynchronize() != cudaSuccess) return false;
-    basalt::core::ConversationCheckpoint ck;
-    ck.ids.assign((size_t) upto, 0);
-    if (!basalt::core::conversation_checkpoint_save(ck, from, g, e)) return false;
-    const basalt::core::CheckpointBytes* cv[5] = {&ck.state_a, &ck.state_b, &ck.state_c, &ck.state_d, &ck.state_e};
-    for (int i = 0; i < 5; ++i) mix(i, cv[i]->data(), cv[i]->size());
-    for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-        basalt::core::ConversationKv img;
-        if (!basalt::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto & ~int64_t(3), true, e)) return false;   // whole pages: the cells past `upto` may hold rejected rows
-        if (cudaDeviceSynchronize() != cudaSuccess) return false;
-        const basalt::core::ConversationBuffer* kb[5] = {&img.k, &img.v, &img.k_scale, &img.v_scale, &img.pooled};
-        for (int i = 0; i < 5; ++i) {   // (the pooled rows past the completed blocks are not state)
-            const size_t cnt = i == 4 ? std::min(kb[i]->size(), (size_t) (upto >> 2) * (size_t) img.idx_dim * 4) : kb[i]->size();
-            kb[i]->visit(0, cnt, [&](const uint8_t* p, size_t n, size_t) { mix(5 + i, p, n); return true; });
-        }
-    }
-    return true;
 }
 
 }  // namespace basalt::models::qwen4exp::serve

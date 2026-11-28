@@ -102,8 +102,13 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     const float* row = gu + r * 2 * n_ff;
     float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
     if (tail == nullptr) {
-        if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu));
-        else h[i] = g / (1.0f + __expf(-g)) * u;
+        if constexpr (CAP) {
+            const float gc = cg > 0.0f ? cg * tanhf(g / cg) : g;
+            const float uc = cu > 0.0f ? cu * tanhf(u / cu) : u;
+            h[i] = __fmul_rn(__fmul_rn(gc, 1.0f / (1.0f + expf(-g))), uc);
+        } else {
+            h[i] = g / (1.0f + __expf(-g)) * u;
+        }
         return;
     }
     // the row's expert: given, or the last q with bounds[q] <= r
@@ -114,8 +119,13 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     const float4 s = *(const float4*) ((const uint8_t*) tail + (size_t) q * tail_stride);   // {s_gate, s_up, s_down, -}
     g *= s.x;
     u *= s.y;
-    if constexpr (CAP) h[i] = __fmul_rn(__fmul_rn(cg * tanhf(g / cg), 1.0f / (1.0f + expf(-g))), cu * tanhf(u / cu)) * s.z;
-    else h[i] = g / (1.0f + __expf(-g)) * u * s.z;
+    if constexpr (CAP) {
+        const float gc = cg > 0.0f ? cg * tanhf(g / cg) : g;
+        const float uc = cu > 0.0f ? cu * tanhf(u / cu) : u;
+        h[i] = __fmul_rn(__fmul_rn(gc, 1.0f / (1.0f + expf(-g))), uc) * s.z;
+    } else {
+        h[i] = g / (1.0f + __expf(-g)) * u * s.z;
+    }
 }
 
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
@@ -153,6 +163,7 @@ void with_type(ggml_type t, F&& f) {
         case GGML_TYPE_IQ3_XXS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ3_XXS>{}); break;
         case GGML_TYPE_IQ3_S: f(std::integral_constant<ggml_type, GGML_TYPE_IQ3_S>{}); break;
         case GGML_TYPE_IQ4_NL: f(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{}); break;
+        case GGML_TYPE_MXFP4: f(std::integral_constant<ggml_type, GGML_TYPE_MXFP4>{}); break;
         case GGML_TYPE_IQ4_XS: f(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{}); break;
         case GGML_TYPE_Q8_0: f(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}); break;
         case GGML_TYPE_Q5_1: f(std::integral_constant<ggml_type, GGML_TYPE_Q5_1>{}); break;
@@ -179,6 +190,7 @@ bool supported(int t) {
         case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_MXFP4:   // the MXFP4 experts (E8M0 scale per 32 values, no per-expert tail)
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // the UD-Q4_K_XL experts
         case GGML_TYPE_Q5_0:   // the UD packs' down layers that keep 5 bits
@@ -335,7 +347,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (form.row_expert == nullptr && (bounds == nullptr || n <= 0)) tail = nullptr;
     const cudaStream_t s = (cudaStream_t) stream;
     const size_t ts = form.tail_stride ? form.tail_stride : sizeof(float4);
-    if (form.gate_softcap > 0.0f)
+    if (form.gate_softcap > 0.0f || form.up_softcap > 0.0f)
         swiglu_kernel<true><<<blocks(rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, interleaved, (const float4*) tail, bounds, n,
                                                                 form.gate_softcap, form.up_softcap, form.row_expert, ts);
     else

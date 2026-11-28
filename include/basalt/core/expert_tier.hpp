@@ -21,6 +21,7 @@
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/route_lossy.hpp"
+#include "basalt/model/peer_hooks.hpp"
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
 #include "basalt/core/file_reads.hpp"
@@ -44,7 +45,10 @@ struct ExpertTierSpec {
     struct Layer {
         int gu_type = 0, d_type = 0;
         uint64_t offset = 0, blob_bytes = 0;
-        float clamp = 0;   ///< the SwiGLU clamp of the layer's experts (0: none)
+        float clamp = 0;          ///< the SwiGLU clamp of the layer's experts (0: none)
+        float gate_softcap = 0;   ///< > 0: SiTU-GLU softcap on gate (cg * tanh(g/cg) * sigmoid(g))
+        float up_softcap = 0;     ///< > 0: SiTU-GLU softcap on up (cu * tanh(u/cu))
+        bool gelu = false;        ///< the GELU gate (tanh form) in place of the SwiGLU
     };
     std::string area;   ///< log area, "basalt <model>"
     std::string name;   ///< the model's name in refusals
@@ -55,7 +59,9 @@ struct ExpertTierSpec {
     std::string path;           ///< the pack
     int fd = -1;                ///< a descriptor of it
     FileRange range;            ///< the experts section
-    std::vector<int> peer_devices;   ///< the second cards, in block order
+    /// The cards the load received: in gpu-mode peer the cards after the main one are the second cards, each holding a
+    /// block of layers, dealt by model::PeerHooks.
+    model::GpuCards gpus;
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< fixed experts per layer (-1: sized from free memory)
     bool diag_tier_frozen = false;
     int vram_reserve_mib = 0, peer_reserve_mib = 600;
@@ -71,6 +77,10 @@ struct ExpertTierSpec {
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
     int claims_per_row = 0;
+    /// With victim_half_life: an admitted expert is promoted only when its lookup count is at least this much above its
+    /// victim's (a promotion moves two experts' bytes through RAM, the victim out and the expert in, so swapping two
+    /// experts about as hot costs more reads than it saves); 0: every admitted expert, the way the first model ran them.
+    int admit_margin = 0;
     /// Tokens after which the lookup counts that pick the main card's victims halve; 0: the slot used longest ago gives way,
     /// the way the first model ran them. With N, the slot whose expert was looked up least lately gives way (every lookup
     /// counts, hits too, and the counts halve every N tokens), the one used longest ago among equals: an expert that recurs
@@ -80,6 +90,9 @@ struct ExpertTierSpec {
     /// same total), for a model whose layers miss at different rates. Empty: every layer the same, the way the first model
     /// ran them. Main card homes are always the same in every layer.
     std::vector<float> layer_weights;
+    /// The main card keeps its homes whatever room RAM has: for a model whose prompts stage the RAM experts on the card
+    /// and never borrow its slots. False: where RAM is roomy the card holds copies only, which a long prompt borrows.
+    bool keep_homes = false;
     /// Bytes of each segment the base arena of copies is mapped in, so a prompt or the caches can borrow part of it
     /// (ExpertTier::lend) and the rest keep their experts; 0: one allocation, which only lend_all gives up.
     uint64_t lend_segment = 0;
@@ -90,6 +103,9 @@ struct ExpertTierSpec {
         std::function<bool(int, std::string&)> set_ring;        ///< the pinned ring of file reads, `ring_pieces` experts
         std::function<void()> ram_only;                         ///< no expert is left in the file
     } host;
+    /// Host bytes the model will claim in RAM after tier sizing (such as a `--ple-io ram` n-gram table locked/touched
+    /// in attach) that `host_available_memory` still counts as available; subtracted when sizing the RAM expert tier.
+    uint64_t host_cache_keep = 0;
     int ring_pieces = 0;
     uint64_t share_stride = 0;   ///< bytes between experts in a second card's prompt staging (the largest layer's)
     int share_max_tokens = 0;    ///< most tokens of a prompt chunk
@@ -99,7 +115,9 @@ struct ExpertTierSpec {
     float route_prior = 0.0f;
 };
 
-class ExpertTier {
+/// The tier is the peer of every model that runs it (model/peer_hooks.hpp): each second card holds the second-card homes of
+/// a block of layers and the prompt share of those layers.
+class ExpertTier final : public model::PeerHooks {
 public:
     static constexpr int kMaxK = 128;     ///< distinct experts one lookup holds (a window of up to 8 rows, 16 each)
     static constexpr int kMaxWindow = 8;
@@ -203,13 +221,17 @@ public:
     /// go out whole and land.
     void mark_gap(cudaStream_t main);
     void pump(int layer, int pieces);
+    /// `layer`'s queued copies (promotions, second card moves) go out whole once `ev` (an event of any card) is reached:
+    /// a model whose windows read the places from tables of their own, which keep the experts where they were until
+    /// the copies land, issues them behind the layer's experts in the next window and lands them (settle) after it.
+    void issue_after(int layer, cudaEvent_t ev);
     static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (core::policy::bus_count) into the VRAM tier; those
     /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. With a
     /// second card, core::policy::peer_bus_count of them cross its own link into its scratch slots instead (`peer`, marked
     /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
     /// makes `main` wait for them.
-    int fetch(int layer, Lookup& lk);
+    int fetch(int layer, Lookup& lk, const Use* use = nullptr);
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
     /// VRAM tier (side stream, off the token path, in pieces).
@@ -225,6 +247,9 @@ public:
         const uint8_t* pinned = nullptr;
     };
     Source locate(int layer, int e) const;
+    /// The host bytes of (layer, e): its pinned RAM place, else the mapped file when the file holds experts; null when
+    /// neither has it (it is on a card).
+    const uint8_t* host_blob(int layer, int e) const;
     /// The first second card (null without any): for "is there a second card" questions; per-layer work takes peer_for.
     core::PeerExperts* peer() const { return peers_.empty() ? nullptr : peers_[0].get(); }
     /// The second card that holds `layer`'s second-card homes (each card owns a block of layers), or null.
@@ -239,8 +264,12 @@ public:
     prefill::PeerShare* share_for(int layer) const {
         return shares_.empty() ? nullptr : shares_[(size_t) layer_card_[(size_t) layer]].get();
     }
-    /// What the split of a layer's experts between the cards prices them at.
-    const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
+    /// Of a prompt layer's experts in pinned RAM (`ram_rows`, in the order the second card takes them), how many the second
+    /// card computes beside its own experts' `peer_rows`, against the main card's `main_rows` and bus bytes `main_bytes`, at
+    /// the layer's prices (prefill::peer_take). In a ringed chunk of `tokens` rows the main card's link reads ahead while
+    /// the layer's attention runs, `pre_route_cycles` main card SM-cycles a row.
+    int peer_take(int layer, const std::vector<int64_t>& ram_rows, int64_t main_rows, double main_bytes, int64_t peer_rows,
+                  int tokens, double pre_route_cycles) const;
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
 
@@ -324,6 +353,14 @@ private:
     bool land_ram(std::string& err);
     bool open_share(size_t card, std::string& err);
     void fill_share_rates();
+    // model::PeerHooks: each second card's plain slots and prompt share, the blocks dealt by the rooms they leave
+    bool peer_card(size_t card, int device, std::string& err) override;
+    uint64_t peer_room(size_t card) const override;
+    model::PeerSpec peer_spec() const override;
+    bool peer_place(const model::PeerPlacement& p, std::string& err) override;
+    std::string peer_main() const override;
+    float* peer_rows_ = nullptr;            ///< the mapped rows the second cards share with the CPU pool, while open() runs
+    int main_homes_ = 0;                    ///< the homes the main card can hold, while open() runs
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     /// `n` copies in each layer, or with `base_shares` each layer's base arena share (base_n).

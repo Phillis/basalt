@@ -10,6 +10,7 @@ from serve.engine.errors import split_err
 
 
 CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
+REPLY_KEY = "_reply"        # sampling key: the prompt's token count where the reply this request continues begins
 
 
 def room_error(n: int, ctx: int) -> ValueError:
@@ -24,8 +25,8 @@ def overflow_error(n: int, max_new: int, ctx: int) -> ValueError:
                       f"prompt ({n} tokens) + max tokens ({max_new}) exceeds the context "
                       f"({ctx}); requests are never truncated. Send a smaller "
                       f"max_tokens (at most {max(0, room)} here), or start the server with "
-                      "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"server\" section of "
-                      "the --config file) to shorten it to the room left")
+                      "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"engine\" section or a "
+                      "model entry of the --config file) to shorten it to the room left")
 
 
 class PromptText:
@@ -60,7 +61,23 @@ class PromptText:
 
     def byte_spans(self) -> list[tuple[int, int]]:
         """The plain spans as byte offsets into the UTF-8 text."""
-        return [(len(self.body[:a].encode("utf-8")), len(self.body[:b].encode("utf-8"))) for a, b in self.plain]
+        if not self.plain:
+            return []
+        body = self.body
+        n = len(body)
+        norm = [(a if 0 <= a <= n else (n if a > n else max(n + a, 0)),
+                 b if 0 <= b <= n else (n if b > n else max(n + b, 0))) for a, b in self.plain]
+        if body.isascii():
+            return norm
+        pts = sorted({i for pair in norm for i in pair})
+        offsets: dict[int, int] = {}
+        pos = byte_off = 0
+        for p in pts:
+            if p > pos:
+                byte_off += len(body[pos:p].encode("utf-8"))
+                pos = p
+            offsets[p] = byte_off
+        return [(offsets[a], offsets[b]) for a, b in norm]
 
     def set_counted(self, n: int, max_new: int) -> None:
         self.n, self.max_new = n, max_new

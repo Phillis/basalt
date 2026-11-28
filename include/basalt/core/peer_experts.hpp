@@ -57,7 +57,7 @@ public:
     bool verify_fill(std::string& err);
     /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
     /// `rows`: the pinned, portable, mapped host rows a share lands in; a share's activations are pinned, portable
-    /// and mapped too.
+    /// and mapped too. A null `rows`: the card writes into the `out` of each launch, never into an armed share's rows.
     bool open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows, std::string& err);
     /// The device bytes free for expert slots.
     uint64_t room() const;
@@ -92,6 +92,10 @@ public:
     bool open_scratch(int n, uint64_t bytes, std::string& err);
     /// Scratch slots still free for the armed share (all of them again once the next one is armed).
     int scratch_free() const { return (int) scratch_.size() - scratch_used_; }
+    /// Whether a share is armed and not raised yet.
+    bool armed() const { return armed_; }
+    /// Whether the armed share holds `expert` in a scratch slot (fetch).
+    bool fetched(int64_t expert) const;
     /// Copies `bytes` at `src` (pinned host memory) into a free scratch slot for `expert`, over this card's own link on a
     /// stream of its own; the slot, or null when none is free.  The armed share's next `raise` plans the expert's entries
     /// where kind is 3, and `run_fetched` queues them behind the copies.
@@ -147,6 +151,9 @@ public:
     /// out[entry] with a scatter kernel (no D2H copy + host memcpy in finish).
     bool launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
                 std::string& err, float* out = nullptr);
+    /// `launch` for a model that states its own layout: the entries i with kind[i] == 2 of `layer`, whose blobs the layout describes.
+    bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
+                       int64_t k, const int32_t* kind, std::string& err, float* out);
     /// Waits for the launched share and writes its rows into `out` (row i = entry i, n_embd floats).
     bool finish(float* out, std::string& err);
 
@@ -252,8 +259,6 @@ private:
     /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
     bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
               std::string& err);
-    bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err, float* out);
 };
 
 }  // namespace basalt::core

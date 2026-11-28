@@ -29,16 +29,19 @@ OWN_TOKENS = ("<|endoftext|>", "<|message_user|>", HEADER, "<|message_system|>",
 MARK0 = 0xF2400                         # the marks of the dialect's own tokens while a message is rendered
 MAX_EFFORT = 0.99
 _NAME = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")')   # a call object's own name, first key
+_ARGS = re.compile(r'"args"\s*:')
 
 
 class _Blocks:
     """The block structure of the model's text. `state` is "between" (a block may open), "reasoning", "content",
-    "name" (a tool call's name) or "call" (its JSON); text is held back while it may still be the start of a marker."""
+    "name" (a tool call's name), "call" (its JSON) or "literal_call" (the JSON of a call the request cannot make, passed
+    on as text); text is held back while it may still be the start of a marker."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
         self.state = "between"
         self.buf = ""
         self.stream_tools = stream_tools
+        self.calls = bool(tools)        # no tools offered (none in the request, or tool_choice "none"): no calls
         self.call: ToolCall | None = None
         self.head = ""                  # the call's `{"name":...,"args":` prefix, once read
         self.raw = ""                   # the call's JSON so far
@@ -105,24 +108,31 @@ class _Blocks:
                 return False
             self.buf, self.state = rest, "content"
             return True
-        self.buf, self.state = rest, "name"
+        self.buf, self.state = rest, "name" if self.calls else "content"
         return True
 
     # ------------------------------------------------------------------ a tool call
     def _name(self, out: list) -> bool:
         at = self.buf.find(TOOL_JSON)
+        end, hdr = self.buf.find(END), self.buf.find(HEADER)
+        cut = min((i for i in (end, hdr) if i >= 0), default=-1)
+        if cut >= 0 and (at < 0 or cut < at):   # this block ended (or a new one opened) with no call: text
+            if cut:
+                out.append(Event("content", self.buf[:cut]))
+            self.buf = self.buf[cut + (len(END) if cut == end else 0):]
+            self.state = "between"
+            return True
         if at < 0:
-            if END in self.buf:         # a name with no call: text
-                end = self.buf.find(END)
-                out.append(Event("content", self.buf[:end]))
-                self.buf, self.state = self.buf[end + len(END):], "between"
-                return True
             return False
         self._open_call(out, self.buf[:at].strip())
         self.buf = self.buf[at + len(TOOL_JSON):]
         return True
 
     def _open_call(self, out: list, name: str) -> None:
+        if not self.calls:              # the request offers no tools: the call is text, its marker and JSON as written
+            out.append(Event("content", TOOL_JSON))
+            self.state = "literal_call"
+            return
         self.call = ToolCall(name=name, arguments={})
         self.state, self.head, self.raw, self.streamed, self.started = "call", "", "", 0, False
         self.json, self.fed = frontend.JsonPrefix(), 0
@@ -130,7 +140,7 @@ class _Blocks:
 
     def _start(self, out: list) -> None:
         """Sends "tool_start" once the call has a name: its header's, or the one its JSON opens with."""
-        if self.started or not self.stream_tools:
+        if self.started:
             return
         if not self.call.name:
             m = _NAME.match(self.raw)
@@ -140,16 +150,18 @@ class _Blocks:
                 self.call.name = json.loads(m.group(1))
             except ValueError:
                 return
+        if not self.stream_tools:
+            return
         self.started = True
         out.append(Event("tool_start", call=self.call))
 
     def _args_text(self) -> str | None:
         """The arguments' JSON text read so far, once the `{"name":...,"args":` prefix has passed."""
         if not self.head:
-            i = self.raw.find('"args":')
-            if i < 0:
+            m = _ARGS.search(self.raw)
+            if not m:
                 return None
-            self.head = self.raw[:i + len('"args":')]
+            self.head = self.raw[:m.end()]
         return self.raw[len(self.head):]
 
     def _stream_args(self, out: list) -> None:
@@ -168,8 +180,14 @@ class _Blocks:
         end = self.buf.find(END)
         keep = 0 if end >= 0 else frontend.hold_back(self.buf, (END,))
         take = self.buf[:end] if end >= 0 else self.buf[:len(self.buf) - keep]
-        self.raw += take
         self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
+        if self.state == "literal_call":
+            if take:
+                out.append(Event("content", take))
+            if end >= 0:
+                self.state = "between"
+            return end >= 0
+        self.raw += take
         self._start(out)
         self._stream_args(out)
         if end < 0:
@@ -193,10 +211,12 @@ class _Blocks:
             self.call = None
             return
         self.call.name = name
-        if self.stream_tools and not self.started:      # the name came with the end: the call is told whole
-            self.started = True
-            out.append(Event("tool_start", call=self.call))
-            out.append(Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=self.call))
+        if self.stream_tools:
+            if not self.started:      # the name came with the end: the call is told whole
+                self.started = True
+                out.append(Event("tool_start", call=self.call))
+            if self.streamed == 0:    # zero-arg call (no "args" key) or args never reached a safe prefix before end
+                out.append(Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=self.call))
         out.append(Event("tool_call", call=ToolCall(name=name, arguments=args, id=self.call.id)))
         self.call = None
 
@@ -309,6 +329,8 @@ def parse_xml(s: str, tools: dict, final: bool):
             if s.startswith("</invoke>", pos):
                 pos += len("</invoke>")
                 break
+            if "</invoke>".startswith(s[pos:]):
+                return (NO,) if final else (MORE,)
             m, wait = _open_tag(s[pos:], _PARAM, "<parameter name=")
             if m is None:
                 return (NO,) if final or wait == NO else (MORE,)
@@ -316,7 +338,7 @@ def parse_xml(s: str, tools: dict, final: bool):
             while True:         # a close counts when a parameter or the invoke's end follows it
                 i = s.find("</parameter>", at)
                 if i < 0:
-                    return (NO,) if final else (MORE,)
+                    return (NO,) if final else (MORE, ">")
                 tail = s[_skip(s, i + len("</parameter>")):]
                 if tail.startswith(("<parameter ", "</invoke>")):
                     break
@@ -356,8 +378,9 @@ class _XmlCalls(frontend.CodeTracker):
         self.stream_tools = stream_tools
         self.buf = ""
         self.pend = False               # buf starts (after whitespace) with an opener that begins a call's text
+        self.wait_gt = False            # inside a parameter value: nothing can change until a closing '>' arrives
         self.lead = False               # a call just ended: the whitespace after it is dropped
-        self.fence, self.line, self.ticks = "", "", 0
+        self._reset_track()
 
     def _call(self, name: str, params: list) -> list:
         props = frontend._tool_properties(self.tools.get(name))
@@ -379,7 +402,7 @@ class _XmlCalls(frontend.CodeTracker):
         return out + [Event("tool_call", call=call)]
 
     def push(self, text: str, final: bool = False) -> list:
-        if self.pend and not final and ">" not in text:     # nothing that can end a tag came
+        if self.pend and self.wait_gt and not final and ">" not in text:     # inside a parameter value: wait for '>'
             self.buf += text
             return []
         self.buf += text
@@ -402,23 +425,24 @@ class _XmlCalls(frontend.CodeTracker):
                     self.buf = self.buf[keep:]
                     break
                 i, op = min(found)
-                snap = (self.fence, self.line, self.ticks)
+                snap = self._snap()
                 self._track(self.buf[:i])
                 quoted = self._in_code()
-                self.fence, self.line, self.ticks = snap
+                self._restore(snap)
                 if quoted:                      # an example in code (a fence or backticks) is text
                     content(self.buf[:i + len(op)])
                     self.buf = self.buf[i + len(op):]
                     continue
                 cut = len(self.buf[:i].rstrip())
                 content(self.buf[:cut])
-                self.buf, self.pend = self.buf[cut:], True
+                self.buf, self.pend, self.wait_gt = self.buf[cut:], True, False
             body = self.buf.lstrip()
             ws = len(self.buf) - len(body)
             r = parse_xml(body, self.tools, final)
             if r[0] == MORE:
+                self.wait_gt = len(r) > 1
                 break
-            self.pend = False
+            self.pend = self.wait_gt = False
             if r[0] == NO:              # text after all: the whitespace and the opener
                 op = next(o for o in XML_OPENERS if body.startswith(o))
                 content(self.buf[:ws + len(op)])
@@ -427,16 +451,17 @@ class _XmlCalls(frontend.CodeTracker):
             for name, params in r[1]:
                 out += self._call(name, params)
             self.buf, self.lead = body[r[2]:], True
-            self.fence, self.line, self.ticks = "", "", 0
+            self._reset_track()
         if final and self.buf:
             content(self.buf)
-            self.buf, self.pend = "", False
+            self.buf, self.pend, self.wait_gt = "", False, False
         return out
 
 
 class Inkling2Parser(_Blocks):
     """The block parser, and the XML-written calls of the answer text read as calls (see _XmlCalls) when the request
-    offers tools."""
+    offers tools. A request that offers none (tool_choice "none" offers none) gets no calls in either notation: what
+    the model writes as one is text."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
         super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools)

@@ -30,6 +30,10 @@ public:
     /// A piece that is itself a vocabulary entry becomes that token whole, not merged from its bytes (Hugging Face
     /// BPE's ignore_merges). Set before load().
     void set_ignore_merges(bool on) { ignore_merges_ = on; }
+    /// SentencePiece's BPE (Hugging Face BPE with byte_fallback after a space -> U+2581 normalizer): a piece starts as its
+    /// characters, a character that is no vocabulary entry as its bytes' byte-fallback tokens (type 6), and U+2581 in the
+    /// text is a space. The tables then spell the space mark as a space. Set before load().
+    void set_sentencepiece(bool on) { spm_ = on; }
 
     bool load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json, std::string& err);
     bool loaded() const { return !raw_.empty(); }
@@ -66,6 +70,13 @@ private:
         uint64_t hash = 0;
         uint32_t key_off = 0, key_len = 0, ids_off = 0, ids_len = 0;   // key_len 0: empty slot
     };
+    struct HeapItem {
+        uint32_t rank;
+        uint32_t pos;
+        int32_t left;
+        int32_t right;
+        int32_t result;
+    };
 
     int32_t find_merge(int32_t left, int32_t right, uint32_t& rank) const;
     bool merge_piece(const uint8_t* p, size_t n, std::vector<int32_t>& out, std::string& err);
@@ -86,11 +97,16 @@ private:
 
     PreTokenize pretokenize_ = nullptr;
     bool ignore_merges_ = false;
+    bool spm_ = false;
+    std::unordered_map<std::string_view, int32_t> chars_;   // sentencepiece: a one-character entry's bytes (in raw_) -> its id
     std::unordered_map<std::string_view, int32_t> whole_;   // with ignore_merges: a plain entry's bytes (in raw_) -> its id
     // scratch for the pre-tokenizer and the merger, kept between calls
     std::vector<size_t> ends_;
     std::vector<int32_t> sym_;
-    std::vector<uint32_t> rank_;
+    std::vector<int32_t> next_;
+    std::vector<int32_t> prev_;
+    std::vector<uint8_t> dead_;
+    std::vector<HeapItem> heap_;
 };
 
 }  // namespace basalt::program

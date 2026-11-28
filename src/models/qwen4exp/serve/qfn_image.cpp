@@ -1,4 +1,5 @@
 // src/models/qwen4exp/serve/qfn_image.cpp - a request's image positions and the quality gate's chunk.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
 #include "basalt/vision/mrope_positions.hpp"
@@ -11,6 +12,11 @@ float QfnRequest::default_relax() const { return runtime_.o.relaxed_drafting; }
 Flow QfnRequest::prepare_image() {
     if (const Flow flow = begin_quality_gate(runtime_.ppl_base, runtime_.ppl_out, runtime_.S); flow != Flow::proceed) return flow;
     if (geni || !runtime_.mrope_identity) {
+        if (runtime_.batch_on()) {
+            std::printf("ERR cannot switch image M-RoPE table while another batch slot is actively decoding\n");
+            std::fflush(stdout);
+            return Flow::next;
+        }
         // positions for every cell this request can reach; the identity again for a text request
         std::string ve;
         runtime_.row_ptr.assign((size_t) n, nullptr);
@@ -70,12 +76,12 @@ Flow QfnRequest::prepare_image() {
         cudaDeviceSynchronize();
         // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
         auto upload_mrope = [&]() -> bool {
-            bool ok = cudaMemcpy(runtime_.d_mrope, runtime_.mrope_host.data(), runtime_.mrope_host.size() * sizeof(int32_t),
+            bool ok = basalt::core::device_copy(runtime_.d_mrope, runtime_.mrope_host.data(), runtime_.mrope_host.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice) == cudaSuccess;
             for (auto& st : runtime_.stages) {
                 const basalt::core::OnDevice on(st->dev);
                 cudaDeviceSynchronize();
-                ok = ok && cudaMemcpy(st->mrope, runtime_.mrope_host.data(), runtime_.mrope_host.size() * sizeof(int32_t),
+                ok = ok && basalt::core::device_copy(st->mrope, runtime_.mrope_host.data(), runtime_.mrope_host.size() * sizeof(int32_t),
                                       cudaMemcpyHostToDevice) == cudaSuccess;
             }
             return ok;

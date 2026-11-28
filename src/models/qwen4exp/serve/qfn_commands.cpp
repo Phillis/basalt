@@ -1,8 +1,10 @@
 // src/models/qwen4exp/serve/qfn_commands.cpp - the protocol commands that reach Flash-Next's tiers.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/program/qwen_forms.hpp"
 #include "models/qwen4exp/adapter.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "basalt/model/batch_check.hpp"
 #include "basalt/vision/ffmpeg_api.hpp"
 #include "../../../program/tokenizer/unicode_flags.hpp"
 #include "../../../program/cli/tokens.hpp"
@@ -72,26 +74,6 @@ bool QfnRuntime::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::ve
     return true;
 }
 
-bool QfnRuntime::windows_in_flight() { return piped && pipe_inflight(); }
-bool QfnRuntime::next_batch_window() { return piped ? pump(true) : batch_step(); }
-// a request reads its prompt through every stage: the groups in flight finish first
-bool QfnRuntime::drain_windows() { return !piped || pipe_drain(); }
-
-void QfnRuntime::script_command(const std::string& line) {
-    char* e1 = nullptr;
-    const long b = std::strtol(line.c_str() + 8, &e1, 10);
-    char* e2 = nullptr;
-    const unsigned long long seed = std::strtoull(e1, &e2, 10);
-    std::vector<int64_t> sids;
-    std::string se;
-    if (b < 0 || b >= (long) bs.size() || e2 == e1 || !cli::parse_i64_list(e2, sids, se)) {
-        std::printf("ERR BSCRIPT: bad slot or list\n");
-        std::fflush(stdout);
-        return;
-    }
-    bscript[(size_t) b].first.assign(sids.begin(), sids.end());
-    bscript[(size_t) b].second = seed;
-}
 
 void QfnRuntime::probe_command(const std::string& line, std::string& perr) {
 if (line.rfind("PROBE set ", 0) == 0) {   // PROBE set workers=K share=F: live values for the next requests
@@ -184,7 +166,7 @@ void QfnRuntime::print_info() {
     // what the server's Monitor tab shows (the server skips unknown lines until READY)
     {
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
@@ -252,16 +234,75 @@ int QfnRuntime::init_after_input() {
     return init_batch();
 }
 
+QfnRuntime::~QfnRuntime() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    {
+        const basalt::core::OnDevice on0(0);
+        if (adapt_stream != nullptr) (void) cudaStreamSynchronize(adapt_stream);
+        (void) cudaDeviceSynchronize();
+        if (adapt_ev != nullptr) { cudaEventDestroy(adapt_ev); adapt_ev = nullptr; }
+        if (p2p_ev != nullptr) { cudaEventDestroy(p2p_ev); p2p_ev = nullptr; }
+        if (adapt_stream != nullptr) { cudaStreamDestroy(adapt_stream); adapt_stream = nullptr; }
+        if (xq_pin != nullptr) { cudaFreeHost(xq_pin); xq_pin = nullptr; }
+        if (pair_snap != nullptr) { cudaFree(pair_snap); pair_snap = nullptr; }
+    }
+    for (auto& st : stages) {
+        const basalt::core::OnDevice on(st->dev);
+        (void) cudaDeviceSynchronize();
+    }
+    for (float* hh : hand_hosts)
+        if (hh != nullptr) cudaFreeHost(hh);
+    hand_hosts.clear();
+    if (hb_host != nullptr) { cudaFreeHost(hb_host); hb_host = nullptr; }
+    if (d_hist != nullptr) {
+        const basalt::core::OnDevice on_h(hist_dev >= 0 ? hist_dev : 0);
+        cudaFree(d_hist);
+        d_hist = nullptr;
+    }
+    for (auto& [d, p] : fixed_res_d) {
+        if (p == nullptr) continue;
+        const basalt::core::OnDevice on(d);
+        cudaFree(p);
+    }
+    fixed_res_d.clear();
+}
+
 void QfnRuntime::at_exit() {
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    apply_pending(true);
+    (void) xq_drain();
     for (int st = 0; st < std::max(n_stages, 1); ++st)
         for (const std::string& r : stage_ver(st).route_report()) basalt::log::info("basalt serve", "%s", r.c_str());
     save_profile("exit");   // QUIT, or the server closed stdin
 }
 
+// --diag-batch-check: the shared batch check over the slots' sessions (model/batch_check.hpp) in place of serving
+int QfnRuntime::batch_check() {
+    if (const int code = init_before_input()) return code;
+    if (const int code = init_after_input()) return code;
+    if (slot_ss.size() < 2) {
+        basalt::log::error("basalt batch", "the batch check needs --batch 2 or more slots");
+        return 1;
+    }
+    std::vector<basalt::model::ModelSession*> ss;
+    for (const auto& s : slot_ss) ss.push_back(s.get());
+    const std::vector<int32_t> prompt(o.tokens.begin(), o.tokens.end());
+    basalt::model::BatchCheck bc;
+    basalt::model::Result r = basalt::model::check_batch(ss.data(), (int) ss.size(), prompt, (int) std::max<int64_t>(o.max_new, 4), n_vocab, bc);
+    if (std::string ce; r.ok() && !commit_settle(ce)) r = {basalt::model::Status::Error, ce};
+    std::printf("%s", bc.report.c_str());
+    if (!r.ok()) {
+        basalt::log::error("basalt batch", "%s", r.message.c_str());
+        return 1;
+    }
+    std::printf("batch check: %d windows compared, %d differ: %s\n", bc.compared, bc.differ, bc.differ ? "FAILED" : "PASSED");
+    return bc.differ ? 1 : 0;
+}
+
 int run(Context& context) {
     QfnRuntime runtime(context);
     runtime.pre_ = {"qwen35", basalt::program::tokenizer::pretok_qwen35};
-    return runtime.execute();
+    return context.o.diag_batch_check ? runtime.batch_check() : runtime.execute();
 }
 
 }  // namespace basalt::models::qwen4exp::serve

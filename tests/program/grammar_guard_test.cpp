@@ -212,6 +212,71 @@ int main() {
         const int32_t answer[] = {7, 0, 1, 8, 9};
         CHECK(g.scan(answer, 5, 0) == -1);
     }
+    {   // "think": false without a grammar: only the thinking block is refused, right after a header
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"text","think":false})", nullptr, 0, err) && g.on());
+        const int32_t ok[] = {5, 7, 10, 10, 8, 5, 10, 11, 9};   // text block, then a call-like block, then the end
+        CHECK(g.scan(ok, 9, 0) == -1);
+        Guard h(bv);
+        CHECK(h.begin(R"({"kind":"text","think":false})", nullptr, 0, err));
+        const int32_t bad[] = {5, 7, 10, 8, 5, 6};
+        CHECK(h.scan(bad, 6, 0) == 5);
+        Draws d{{7}, {}, {}};
+        int32_t tok = -1;
+        CHECK(h.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn && tok == 7);
+        CHECK(std::isinf(d.masks[0][6]) && d.masks[0][5] == 0.0f && d.masks[0][7] == 0.0f);
+        const int64_t header[] = {5};
+        Guard p(bv);   // a prompt that ends with a header: the first token is the block's
+        CHECK(p.begin(R"({"kind":"text","think":false})", header, 1, err));
+        const int32_t first[] = {6};
+        CHECK(p.scan(first, 1, 0) == 0);
+        Guard t(bv);   // thinking on: the text kind refuses nothing
+        CHECK(t.begin(R"({"kind":"text"})", nullptr, 0, err) && !t.on());
+    }
+    {   // no calls: every block is a text block, the mask holds only its tag after a header
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"text","calls":false,"think":false})", nullptr, 0, err) && g.on());
+        const int32_t ok[] = {5, 7, 10, 8, 5, 7, 10};
+        CHECK(g.scan(ok, 7, 0) == -1);
+        const int32_t bad[] = {8, 5, 10};
+        CHECK(g.scan(bad, 3, 0) == 2);
+        Draws d{{7}, {}, {}};
+        int32_t tok = -1;
+        CHECK(g.redraw({}, d.draw(), d.read(), tok) == Redraw::drawn && tok == 7);
+        CHECK(d.masks[0][7] == 0.0f && std::isinf(d.masks[0][10]) && std::isinf(d.masks[0][6]));
+    }
+    {   // "think": false under a lazy tool grammar: free text until a call, the thinking block still refused
+        const PackVocab bv = load_blocks();
+        Guard g(bv);
+        CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err) && g.on());
+        const int32_t ok[] = {5, 7, 10, 10, 8, 5, 10};
+        CHECK(g.scan(ok, 7, 0) == -1);
+        const int32_t bad[] = {8, 5, 6};
+        CHECK(g.scan(bad, 3, 0) == 2);
+        Guard j(bv);   // after a header only a text block or the start of a tool's name
+        CHECK(j.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err));
+        const int32_t junk[] = {5, 0};
+        CHECK(j.scan(junk, 2, 0) == 1);
+        Guard r(bv);   // tool_choice required: no text block either
+        CHECK(r.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"required","think":false})",
+                      nullptr, 0, err));
+        const int32_t txt[] = {5, 7};
+        CHECK(r.scan(txt, 2, 0) == 1);
+        Guard r2(bv);
+        CHECK(r2.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"required","think":false})",
+                       nullptr, 0, err));
+        const int32_t call[] = {5, 10};
+        CHECK(r2.scan(call, 2, 0) == -1);
+        Guard k(bv);   // the thinking token never opens, whatever precedes it
+        CHECK(k.begin(R"({"kind":"tools","tools":[{"name":"hello","parameters":{}}],"tool_choice":"auto","think":false})",
+                      nullptr, 0, err));
+        const int32_t mid[] = {5, 7, 10, 6};
+        CHECK(k.scan(mid, 4, 0) == 3);
+    }
     {   // tool_choice none: no grammar, the guard stays off
         Guard g(pv);
         CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"f","parameters":{}}],"tool_choice":"none"})", nullptr, 0, err));
@@ -325,6 +390,59 @@ int main() {
     {
         Guard g(pv);
         CHECK(!g.begin("{", nullptr, 0, err));
+    }
+    {   // ERNIE reply_form (<ernie:think> / </ernie:think>) and compact shared-block tool_form
+        // ids: 0 { 1 } 2 <ernie:think> 3 </ernie:think> 4 <ernie:tool_call> 5 </ernie:tool_call>
+        //      6 <|ernie:im_end|> 7 "\n" 8 <invoke 9 " name=\"f\">" 10 <parameter
+        //      11 " name=\"x\">" 12 ok 13 </parameter> 14 </invoke> 15 hello
+        std::string eerr;
+        const char* ev =
+            "{\"{\": 0, \"}\": 1, \"<ernie:think>\": 2, \"</ernie:think>\": 3, \"<ernie:tool_call>\": 4, "
+            "\"</ernie:tool_call>\": 5, \"<|ernie:im_end|>\": 6, \"\xC4\x8A\": 7, \"<invoke\": 8, "
+            "\"\xC4\xA0name=\\\"f\\\">\": 9, \"<parameter\": 10, \"\xC4\xA0name=\\\"x\\\">\": 11, "
+            "\"ok\": 12, \"</parameter>\": 13, \"</invoke>\": 14, \"hello\": 15}";
+        const char* et = "[1, 1, 4, 4, 4, 4, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1]";
+        ReplyForm erf;
+        erf.think_open = "<ernie:think>";
+        erf.think_close = "</ernie:think>";
+        set_reply_form(erf);
+        PackVocab epv;
+        CHECK(vocab_from_pack(ev, et, 16, {6}, epv, eerr));
+        set_reply_form(ReplyForm());
+        CHECK(epv.think_open == 2 && epv.think_close == 3);
+
+        ToolForm saved_tf = tool_form();
+        ToolForm etf;
+        etf.call_open = "<ernie:tool_call>\n";
+        etf.call_close = "\n</ernie:tool_call>";
+        etf.fn_open = "<invoke name=\"";
+        etf.fn_mid = "\">";
+        etf.fn_close = "</invoke>";
+        etf.param_open = "<parameter name=\"";
+        etf.param_mid_text = "\">";
+        etf.param_mid_value = "\">";
+        etf.param_close = "</parameter>";
+        etf.text_end = "</parameter>";
+        etf.calls_share_block = true;
+        etf.trigger = "<ernie:tool_call>";
+        set_tool_form(etf);
+
+        const std::string etools =
+            R"({"kind":"tools","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object",)"
+            R"("properties":{"x":{"type":"string"}},"required":["x"]}}}],"tool_choice":"auto"})";
+        const int64_t think_prompt[] = {2};
+        // Mentioning <ernie:tool_call> inside <ernie:think> does not trigger the tool grammar; after </ernie:think>,
+        // a compact call block and parallel calls pass with zero misses.
+        Guard gt(epv);
+        CHECK(gt.begin(etools, think_prompt, 1, eerr));
+        const int32_t seq[] = {15, 4, 15, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 7, 8, 9, 10, 11, 12, 13, 14, 7, 5, 6};
+        CHECK(gt.scan(seq, (int) (sizeof seq / sizeof seq[0]), 0) == -1 && gt.misses() == 0);
+        // JSON schema waits for </ernie:think> before enforcing `{}`
+        Guard gj(epv);
+        CHECK(gj.begin(jo, think_prompt, 1, eerr));
+        const int32_t jseq[] = {15, 4, 3, 0, 1, 6};
+        CHECK(gj.scan(jseq, 6, 0) == -1 && gj.misses() == 0);
+        set_tool_form(saved_tf);
     }
     if (g_fail == 0) std::printf("grammar_guard_test: ok\n");
     return g_fail == 0 ? 0 : 1;

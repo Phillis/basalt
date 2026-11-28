@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next precision
 
-Where Flash-Next rounds and what each rounding costs. Method and reference: [quality](quality.md). Guide:
-[Flash-Next](../models/qwen38-flash-next.md).
+Where Flash-Next rounds and what each rounding costs. Guide: [Flash-Next](../models/qwen38-flash-next.md).
+Method: the [quality suite](quality-suite.md) (preferred). The KLD, PPL and top-1 figures on this page were measured with [wikitext KLD](quality.md#wikitext-kld).
 
 Test setup: RTX 5090 at 400 W with an RTX 5060 Ti at 180 W as the peer expert tier, 128 GB of system RAM. Each number names its
 build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 QSA), 512 experts, top-10.
@@ -35,6 +35,15 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Drafter | Q8_0 and BF16 dense; Q2_0 experts in VRAM | proposes only; verify decides |
 | KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |
 | GDN state and conv history | fp32 | fp32 |
+
+`q4_0` fuses K/V post-processing (norm, RoPE, the Hadamard rotation and the Q4_0 pack) and uses the same decode
+attention launches as `int8`. Attention copies packed rows directly into shared memory, then unpacks in registers
+for the FP32 dot products and value accumulation. It reads 576 bytes per selected cell across both KV heads,
+compared with 1,056 for `int8`. A streamed cache (`--kv-resident`) uses the per-token path and also writes the host copy.
+
+Random Q4_0 attention outputs match the GPU reference bit for bit, with a maximum absolute error of 1.8e-8 against the
+double-precision CPU reference (`q4_attn_bench`). The fused Q4_0 prelude rotates Q, K and V with warp shuffles and exchanges K and
+V together across warps; the rotated Q/K and the packed K/V blocks match the separate kernels bit for bit (`qsa_dec_fused_parity`).
 
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
 
@@ -74,7 +83,7 @@ Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8
 
 ## QAD checkpoint
 
-The [QAD pack](../model-file.md#flash-next-qad-pack) keeps the routed experts bit for bit and re-quantizes the checkpoint's
+The [QAD pack](../model-file/qwen38-flash-next.md#flash-next-qad-pack) keeps the routed experts bit for bit and re-quantizes the checkpoint's
 MXFP8 projections and NVFP4 shared experts to Q6_K. Gate: 100 chunks, 400 W + 180 W, tiers pinned, int8 KV; decode is
 `basalt-bench` on two cards, int8 KV.
 
@@ -126,6 +135,10 @@ a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, 
 The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
 the prompt's.
+
+IQ2_S, IQ3_XXS and IQ3_S gate/up with Q5_1 down can use the device-planned tail. On the mixed IQ3_S-Q4 pack, enabling
+these pairs changes the decode path. With tiers pinned, the BF16 gate (100 chunks, T 3, INT8 KV) measured PPL 3.23857 to
+3.24341, mean KLD 0.0954673 to 0.0954654, and top-1 agreement 89.8314% to 89.8471%.
 
 ## 6-bit dense projections
 
@@ -202,6 +215,13 @@ Costs: the Q6_K head adds KLD 0.0022 [0.0018, 0.0025] (1.5%) and PPL 0.25% (IQ3_
 25,500 rows. The Q8_0 two-stage head is 350 us per window against 439 us for the Q8_0 head (NVFP4, cold prose, 400 W + 180 W).
 Greedy output with the tiers pinned matches the exact head token for token.
 
+## Several cards
+
+`gpu-mode peer` on two cards against one card (BF16 KLD through the decode path, 100 chunks, `--kv int8`, window 3): 0.06174 against
+0.06221 (paired difference -0.0005 [-0.0013, +0.0004]), top-1 91.84% against 91.80%. A peer's prompt stages run each card's own
+cuBLAS algorithms; `--diag-main-card-bits` gives them the main card's and the stages are then bitwise
+([diagnostics](../configuration/diagnostics.md)). `gpu-mode split` against `--diag-gpu-same` is bitwise under the same flag, tokens and logits.
+
 ## GDN split across two cards
 
 With a peer card faster than the main card, each GDN mixer may be split by key head. The split changes reduction order, so output
@@ -217,7 +237,7 @@ off on 320x240 and 640x360 sources, 0.1% on a 720x358 one (40 of 14.9 M two step
 What differs is the resize: the image path's Pillow-style bicubic against torchvision's float antialiased bicubic.
 
 A group's two frames go through the patch embedding's two temporal taps apart (W0 a + W1 b, rel L2 6e-7 to 9e-7 against double
-precision). A picture keeps the summed taps, so image output is bitwise as before. In the prompt, the template's whole video marker
+precision). A picture keeps the summed taps. In the prompt, the template's whole video marker
 becomes per-group `<t seconds>` text and pads, as the processor at the model's release (transformers 4.57.1) writes it.
 
 ## Lossy routing flags

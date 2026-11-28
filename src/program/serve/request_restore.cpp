@@ -1,5 +1,6 @@
 // src/program/serve/request_restore.cpp - request restore operations.
 #include "prefix_anchor.hpp"
+#include "prompt_parts.hpp"
 #include "request.hpp"
 
 namespace basalt::program::serve {
@@ -18,9 +19,9 @@ bool Request::starts_with(const std::vector<int32_t>& pre, const std::vector<Img
 // can continue (the live one, or an idle slot's) holds ids that spell exactly the bytes of the prompt's next tokens,
 // ending on a prompt token boundary, the held ids stand for those tokens: the request continues them instead of
 // reading the reply again from a checkpoint (and leaving a copy of the conversation behind in another slot).
-// Not with pictures, when a token has no bytes, or when the longer prompt would leave no room for max_new.
+// Pictures inside the respelled span cannot be matched; ones after its end stay in the prompt tail.
 void Request::respell_prompt() {
-    if (geni || !runtime_.req_imgs.empty() || !runtime_.text_tokenizer_note.empty()) return;
+    if (geni || !runtime_.text_tokenizer_note.empty()) return;
     const auto bytes = [this](int32_t id) { return runtime_.token_bytes(id); };
     const std::vector<int32_t>* best = nullptr;
     HeldMeet meet;
@@ -40,7 +41,9 @@ void Request::respell_prompt() {
             const BSlot& sl = runtime_.bs[(size_t) b];
             if (b != own_slot && !sl.active && sl.cached && sl.cvec == want_cvec && sl.imgs.empty()) offer(sl.ids, b);
         }
-    if (best == nullptr || !meet.respelled()) return;
+    if (best == nullptr) return;
+    const int64_t first_image = runtime_.req_imgs.empty() ? -1 : runtime_.req_imgs.front().start;
+    if (!respell_before_media(meet, first_image)) return;
     const int64_t grown = meet.held + n - meet.resume;
     const int64_t ctx = runtime_.admit_slot >= 0 ? runtime_.slot_context(runtime_.admit_slot) : runtime_.o.max_context;
     if (!respell_fits(grown, n, runtime_.admit_slot >= 0 ? runtime_.admit_max_new : (long long) max_new, ctx)) return;
@@ -72,6 +75,7 @@ Flow Request::restore() {
     slot_b = runtime_.solo_slot >= 0 ? runtime_.solo_slot : runtime_.admit_slot;
     in_slot = runtime_.slot0_solo() && slot_b > 0;
     solo_req = in_slot && runtime_.solo_slot > 0;   // decoded here, solo-style, on the slot's own state
+    batch_first = in_slot && !solo_req;
     if (runtime_.stats.on) {   // the slot's console figures are this request's from here
         runtime_.stats.start(slot_b);
         runtime_.stats_tick(true);
@@ -86,6 +90,7 @@ Flow Request::restore() {
         slot_draft_out();
         solo_book = {std::move(runtime_.live), std::move(runtime_.live_imgs), runtime_.live_ok, runtime_.cvec_cached, std::move(runtime_.checks)};
         runtime_.solo_out = &solo_book;   // idle while this request works in its slot
+        slot_swapped = true;
         BSlot& sb = runtime_.bs[(size_t) slot_b];
         runtime_.live.clear();
         runtime_.live_imgs.clear();
@@ -106,6 +111,7 @@ Flow Request::restore() {
         sb.partial = false;
         sb.checks.clear();
         if (const Flow flow = slot_bind(); flow != Flow::proceed) return flow;
+        slot_bound = true;
     }
     if (!in_slot) runtime_.solo_draft_back(true);   // when a request in another slot ended before it gave them back
     runtime_.solo_busy = !in_slot;
@@ -116,8 +122,10 @@ Flow Request::restore() {
         runtime_.live_imgs = std::move(s0.imgs);
         runtime_.live_ok = runtime_.o.prompt_cache > 0;
         runtime_.cvec_cached = s0.cvec;
-        for (ConvCheckpoint& c : s0.checks) runtime_.checks.push_back(std::move(c));
-        s0.checks.clear();
+        merge_slot_checkpoints(s0.checks, runtime_.checks,
+                               [](const int32_t* a, size_t n_ids, const int32_t* b) {
+                                   return basalt::core::conversation_ids_equal(a, n_ids, b);
+                               });
         s0.cached = false;
         if (!slot_draft_in(0)) runtime_.live_ok = false;   // the draft K/V with it
     }
@@ -233,10 +241,9 @@ Flow Request::restore() {
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
         std::string de;
-        if (!runtime_.capture_admit(need, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
-                              "admission; need %llu MiB)", (long long) on_disk.tokens,
-                              (unsigned long long) (need >> 20));
+        if (basalt::core::Admission why; !runtime_.capture_admit(need, floor, &why)) {
+            basalt::log::warn("basalt serve", "conversation cache: %lld tokens on disk not read: %s",
+                              (long long) on_disk.tokens, basalt::core::conversation_refusal(why).c_str());
         } else if (!runtime_.disk.load(on_disk, image, de)) {
             basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
                               "dropped", de.c_str());

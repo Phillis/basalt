@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
 BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
 # bench's own options that share an engine flag's name
-BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed", "--gpu"}
+BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed", "--gpu", "--gpu-mode", "--gpu-share"}
 
 
 def engine_flags() -> list[str]:
@@ -51,7 +51,7 @@ class BenchFlags(unittest.TestCase):
         parsed = {f for s in sources for f in re.findall(r'a == "(--[a-z0-9-]+)"', s.read_text())}
         self.assertTrue(parsed)
         self.assertEqual(sorted(set(flags) - parsed), [])
-        for known in ("--spec", "--kv", "--max-context", "--gpu"):
+        for known in ("--spec", "--kv", "--max-context", "--gpu", "--gpu-mode", "--gpu-share"):
             self.assertIn(known, flags)
 
     def test_every_engine_flag_reaches_the_engine(self):
@@ -108,7 +108,10 @@ class BenchFlags(unittest.TestCase):
         return r.stdout.split()
 
     def test_community_refuses_anything_that_changes_the_workload(self):
-        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"], ["--quality"], ["--seed", "7"],
+        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"],
+                      ["--quality", "ref.safetensors"], ["--kld"], ["--smoke"], ["--quality-top", "64"],
+                      ["--quality-role", "all"], ["--quality-max-context", "4096"], ["--quality-boot", "100"],
+                      ["--kld-base", "base.kld"], ["--kld-t", "5"], ["--seed", "7"],
                       ["--set", "--kv int8"], ["-o", "json"], ["--engine", "x"], ["--", "--spec", "3"]):
             with self.subTest(extra=extra):
                 r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", *extra],
@@ -124,19 +127,66 @@ class BenchFlags(unittest.TestCase):
                 self.assertEqual(r.returncode, 2)
                 self.assertIn("--submitter", r.stderr)
 
-    def test_community_uses_every_visible_card_and_refuses_gpu(self):
-        cmd = self.command_community()
-        plan = subprocess.run([str(ENGINE), "--gpu-plan", "--gpu", "auto"], capture_output=True, text=True)
-        self.assertEqual(plan.returncode, 0, plan.stderr)
-        self.assertEqual(cmd[cmd.index("--gpu") + 1], json.loads(plan.stdout)["devices"])   # every visible card
-        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", "--gpu", "0"], capture_output=True, text=True)
+    def test_community_takes_the_users_cards_and_mode(self):
+        base = [str(BENCH), "--model", "m.basalt", "--fixtures", str(self.fixtures), "--print-command", "--community", "--submitter", "test"]
+        r = subprocess.run([*base, "--gpu", "0"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cmd = r.stdout.split()
+        self.assertEqual(cmd[cmd.index("--gpu") + 1], "0")
+        self.assertNotIn("--gpu-mode", cmd)
+        # the engine's plan is asked for the cards as the run has them: a mode with one card is refused the engine's way
+        r = subprocess.run([*base, "--gpu", "0", "--gpu-mode", "peer"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
-        self.assertIn("incomparable", r.stderr)
+        self.assertIn('gpu-mode peer: gpu names one card (gpu "0"); a mode needs two or more', r.stderr)
+        r = subprocess.run([*base, "--gpu", "auto"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('gpu "auto": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md', r.stderr)
+
+    def test_a_card_list_needs_a_mode(self):
+        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--print-command", "--gpu", "0,1"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md" if "names 2" in r.stderr else "gpu 1: ", r.stderr)
 
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)
         self.assertIn("Engine flags (passed to basalt):", r.stdout)
         self.assertIn("--max-context", r.stdout)
+        self.assertIn("--quality FILE", r.stdout)
+        self.assertIn("--smoke", r.stdout)
+        self.assertIn("--quality-top", r.stdout)
+        self.assertIn("--quality-role", r.stdout)
+        self.assertIn("--quality-max-context", r.stdout)
+        self.assertIn("--quality-boot", r.stdout)
+        self.assertIn("--kld [N]", r.stdout)
+        self.assertIn("--kld-base FILE", r.stdout)
+        self.assertIn("--kld-t T", r.stdout)
+        self.assertNotIn("--quality-t ", r.stdout)
+
+    def test_quality_and_kld_flag_validation(self):
+        # --quality requires a reference file path and defaults --max-context to 5120
+        cmd = self.command("--quality", "ref.safetensors")
+        self.assertEqual(cmd[cmd.index("--max-context") + 1], "5120")
+        self.assertEqual(cmd[cmd.index("--prompt-cache") + 1], "0")
+        cmd = self.command("--quality", "ref.safetensors", "--", "--prompt-cache", "2")
+        self.assertEqual(cmd[cmd.index("--prompt-cache") + 1], "2")
+        cmd = self.command("--quality", "ref.safetensors", "--quality-max-context", "8192")
+        self.assertEqual(cmd[cmd.index("--max-context") + 1], "8192")
+        cmd = self.command("--quality", "ref.safetensors", "--", "--max-context", "16384")
+        self.assertEqual(cmd[cmd.index("--max-context") + 1], "16384")
+        for bad in (["--quality"], ["--quality", "ref.safetensors", "--quality-role", "bogus"],
+                    ["--quality", "ref.safetensors", "--quality-top", "0"],
+                    ["--quality", "ref.safetensors", "--quality-top", "257"],
+                    ["--quality", "ref.safetensors", "--quality-boot", "-1"],
+                    ["--kld", "--kld-t", "0"]):
+            with self.subTest(bad=bad):
+                r = subprocess.run([str(BENCH), "--engine", str(ENGINE), "--model", "m.basalt", *bad],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2)
+        # --kld without --kld-base is refused
+        r = subprocess.run([str(BENCH), "--engine", str(ENGINE), "--model", "m.basalt", "--kld"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--kld-base", r.stderr)
 
 
 if __name__ == "__main__":

@@ -10,20 +10,45 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import convert  # noqa: E402
+import verify_pack  # noqa: E402
 from gguf_writer import GGUFWriter  # noqa: E402
 from model_file import SECTION_ALIGN, ModelFile  # noqa: E402
 
 N_EXPERT, N_LAYERS, ROWS = 4, 2, 5
 TOKENS = ["a", "b", "c", "d"]
-BLOCK = {"IQ1_S": 50, "IQ2_XXS": 66, "Q6_K": 210, "IQ4_NL": 18}
+CHAT_TEMPLATE = "{{ messages }}"
+BLOCK = {"IQ1_S": 50, "IQ2_XXS": 66, "Q6_K": 210, "IQ4_NL": 18, "Q5_K": 176, "MXFP4": 17, "F8_E4M3_RAW": 33}
+# the Engram types the engine reads: the values in a block, the bytes of a row of 256 values the pack records for each,
+# and the ggml type. F8_E4M3_RAW is type 43 as the standalone MXFP8 table stores it (a scale, then 32 codes).
+ENGRAM_BLOCK_VALUES = {"IQ4_NL": 32, "Q5_K": 256, "Q6_K": 256, "MXFP4": 32, "F8_E4M3_RAW": 32}
+ENGRAM_ROW_BYTES = {"IQ4_NL": 144, "Q5_K": 176, "Q6_K": 210, "MXFP4": 136, "F8_E4M3_RAW": 264}
+GGML_TYPE = {"IQ4_NL": 20, "Q5_K": 13, "Q6_K": 14, "MXFP4": 39, "F8_E4M3_RAW": 43}
 GU = ["IQ1_S", "IQ2_XXS"]          # gate/up type per layer
 DOWN = ["IQ2_XXS", "IQ1_S"]        # down type per layer
 
 
 class DeepSeek41Test(unittest.TestCase):
+    engram_type = "IQ4_NL"     # the Engram table type setUp writes
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.t = Path(self.tmp.name)
+        self.gguf = self.write_model(self.t / "ds-00001-of-00001.gguf", self.engram_type)
+        self._orig = convert.export_tokenizer
+
+        def tokenizer_files(first, out_dir):
+            d = Path(out_dir) / "tokenizer"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "tokenizer.json").write_bytes(b"{}")
+            return sorted(d.iterdir())
+        convert.export_tokenizer = tokenizer_files
+
+    def tearDown(self):
+        convert.export_tokenizer = self._orig
+        self.tmp.cleanup()
+
+    def write_model(self, path, table_type="IQ4_NL"):
+        """A tiny deepseek41 GGUF whose Engram table is `table_type`; every raw tensor lands in self.raw."""
         rng = np.random.default_rng(3)
         g = GGUFWriter()
         P = "deepseek41."
@@ -42,6 +67,7 @@ class DeepSeek41Test(unittest.TestCase):
         g.add(P + "engram.vocab_size", 16, "u32")
         g.add(P + "engram.token_map", [0, 1, 2, 3], "array:u32")
         g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add("tokenizer.chat_template", CHAT_TEMPLATE)
         self.raw = {}
 
         def raw(name, shape, ty, n_blocks):
@@ -50,26 +76,14 @@ class DeepSeek41Test(unittest.TestCase):
             g.add_raw(name, shape, ty, data)
 
         raw("token_embd.weight", [256, 3], "Q6_K", 3)
-        raw("per_layer_token_embd.weight", [256, ROWS], "IQ4_NL", 8 * ROWS)
+        raw("per_layer_token_embd.weight", [256, ROWS], table_type, ROWS * 256 // ENGRAM_BLOCK_VALUES[table_type])
         for l in range(N_LAYERS):
             g.add_f32(f"blk.{l}.ffn_gate_inp.weight", rng.standard_normal((8, N_EXPERT)))
             g.add_f32(f"blk.{l}.attn_norm.weight", rng.standard_normal(8))
             raw(f"blk.{l}.attn_q_a.weight", [256, 2], "Q6_K", 2)
             for role, ty in (("gate", GU[l]), ("up", GU[l]), ("down", DOWN[l])):
                 raw(f"blk.{l}.ffn_{role}_exps.weight", [256, 2, N_EXPERT], ty, 2 * N_EXPERT)
-        self.gguf = g.write(self.t / "ds-00001-of-00001.gguf")
-        self._orig = convert.export_tokenizer
-
-        def tokenizer_files(first, out_dir):
-            d = Path(out_dir) / "tokenizer"
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "tokenizer.json").write_bytes(b"{}")
-            return sorted(d.iterdir())
-        convert.export_tokenizer = tokenizer_files
-
-    def tearDown(self):
-        convert.export_tokenizer = self._orig
-        self.tmp.cleanup()
+        return g.write(path)
 
     def args(self, **kw):
         d = dict(gguf=[str(self.gguf)], mmproj=None, out=str(self.t / "out.basalt"), mtp_source=None, mtp_dense=None,
@@ -93,7 +107,9 @@ class DeepSeek41Test(unittest.TestCase):
         self.assertIsNone(meta["vision"])
         self.assertIsNone(meta["mtp"])
         e = meta["engram"]
-        self.assertEqual((e["rows"], e["row_values"], e["row_bytes"], e["bytes"]), (ROWS, 256, 144, ROWS * 144))
+        rb = ENGRAM_ROW_BYTES[self.engram_type]
+        self.assertEqual((e["rows"], e["row_values"], e["row_bytes"], e["bytes"]), (ROWS, 256, rb, ROWS * rb))
+        self.assertEqual((e["type"], e["type_id"]), (self.engram_type, GGML_TYPE[self.engram_type]))
         self.assertEqual(e["ple.layer_multipliers"], [7, 11])
         self.assertEqual(e["ple.head_vocab_sizes"], [2, 3])
 
@@ -103,7 +119,57 @@ class DeepSeek41Test(unittest.TestCase):
         self.assertEqual(m.read("engram"), self.raw["per_layer_token_embd.weight"])
         meta = json.loads(m.read("meta"))
         t = meta["tensors"]["per_layer_token_embd.weight"]
-        self.assertEqual((t["section"], t["offset"], t["type"], t["shape"]), ("engram", 0, "IQ4_NL", [256, ROWS]))
+        self.assertEqual((t["section"], t["offset"], t["type"], t["shape"]),
+                         ("engram", 0, self.engram_type, [256, ROWS]))
+        self.assertEqual(t["bytes"], ROWS * ENGRAM_ROW_BYTES[self.engram_type])
+
+    def test_every_engram_row_type_converts_as_published(self):
+        for ty, rb in ENGRAM_ROW_BYTES.items():
+            with self.subTest(type=ty):
+                gguf = self.write_model(self.t / f"tbl-{ty}-00001-of-00001.gguf", ty)
+                out = self.t / f"out-{ty}.basalt"
+                convert.convert(self.args(gguf=[str(gguf)], out=str(out)))
+                m = ModelFile(str(out))
+                table = self.raw["per_layer_token_embd.weight"]
+                self.assertEqual(len(table), ROWS * rb)          # one super-block, or eight 17-, 18- or 33-byte blocks
+                self.assertEqual(m.read("engram"), table)        # byte for byte, requantized by no one
+                e = json.loads(m.read("meta"))["engram"]
+                self.assertEqual((e["type"], e["type_id"], e["row_values"], e["row_bytes"], e["bytes"]),
+                                 (ty, GGML_TYPE[ty], 256, rb, ROWS * rb))
+
+    def test_verify_compares_the_engram_table_of_every_row_type(self):
+        """--verify hashes each tensor against its source: the table at its own byte count, not its GGUF geometry's."""
+
+        def tokenizer_files(first, out_dir):     # what --verify reads next to tokenizer.json
+            d = Path(out_dir) / "tokenizer"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "tokenizer.json").write_bytes(b"{}")
+            (d / "vocab.json").write_text(json.dumps({t: i for i, t in enumerate(TOKENS)}))
+            (d / "merges.txt").write_text("")
+            (d / "token_type.json").write_text("{}")
+            (d / "chat_template.jinja").write_text(CHAT_TEMPLATE)
+            return sorted(d.iterdir())
+
+        orig, convert.export_tokenizer = convert.export_tokenizer, tokenizer_files
+        try:
+            for ty in ENGRAM_ROW_BYTES:
+                with self.subTest(type=ty):
+                    gguf = self.write_model(self.t / f"v-{ty}-00001-of-00001.gguf", ty)
+                    out = self.t / f"v-{ty}.basalt"
+                    convert.convert(self.args(gguf=[str(gguf)], out=str(out)))
+                    self.assertTrue(verify_pack.verify(str(out), str(gguf)), ty)
+        finally:
+            convert.export_tokenizer = orig
+
+    def test_an_engram_type_the_engine_cannot_read_is_refused(self):
+        # Q4_K is 144 bytes a 256-value block: the shard holds whole blocks, so the table's type is what refuses it
+        g = GGUFWriter()
+        g.add("general.architecture", "deepseek41")
+        g.add_raw("per_layer_token_embd.weight", [256, ROWS], "Q4_K", bytes(ROWS * 144))
+        p = g.write(self.t / "q4k-00001-of-00001.gguf")
+        with self.assertRaises(SystemExit) as cm:
+            convert.convert(self.args(gguf=[str(p)]))
+        self.assertIn("IQ4_NL, Q5_K, Q6_K, MXFP4 or MXFP8", str(cm.exception))
 
     def test_gguf_section_holds_the_quantized_tensors_but_not_the_table(self):
         convert.convert(self.args())

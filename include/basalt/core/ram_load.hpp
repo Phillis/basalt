@@ -76,8 +76,8 @@ inline uint64_t pin_mapping_bytes(uint64_t pinned) { return pinned / 512; }
 
 /// Host memory an engine takes after its RAM tier has read the free RAM: the CUDA runtime's own host memory for the graphs it
 /// captures, the first request's buffers, the second card's context.  The tier's plan leaves it free beside the reserve; the
-/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  0.2.1 left
-/// 2 GiB for it (kLateHostBytes); 0.3.1 removed that and a 64 GB box started at or below its guard (#339).
+/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  Without it a
+/// box with little RAM would start at or below its guard.
 inline constexpr uint64_t kPostPlanHostBytes = 2ull << 30;
 
 /// The reserve a RAM tier is sized against: the free RAM the user asked for (`reserve`, the guard's line) and the
@@ -91,6 +91,20 @@ inline uint64_t plan_reserve(uint64_t reserve) { return reserve > 0 ? reserve + 
 inline uint64_t ram_tier_room(uint64_t avail, uint64_t reserve, bool pinned) {
     const uint64_t above = avail > reserve ? avail - reserve : 0;
     return pinned ? above - (above + 36) / 37 : above;
+}
+
+/// The bytes of experts a tier or copy of experts may pack into `room_bytes` when `spare_bytes` of free places, none
+/// larger than `max_spare_blob`, live beside them: `budget_bytes` when the room has that beside it, so a budget with
+/// room to spare keeps every expert it was given, else the room minus the places: the places stay whole beside the
+/// pack, and the coldest experts of the pack are the ones left to the file.  `budget_bytes` unchanged when the room
+/// holds the places and at most one place beside them: such a room funds no places whatever the pack does, since the
+/// check that follows reads the free RAM again and a little lower, and the caller reports them lost.
+inline uint64_t ram_tier_pack_bytes(uint64_t budget_bytes, uint64_t room_bytes, uint64_t spare_bytes,
+                                   uint64_t max_spare_blob) {
+    if (spare_bytes == 0 || spare_bytes >= room_bytes) return budget_bytes;   // no places, or no room for them
+    const uint64_t fits = room_bytes - spare_bytes;
+    if (fits <= max_spare_blob) return budget_bytes;   // the places alone fill the room
+    return budget_bytes < fits ? budget_bytes : fits;
 }
 
 /// What the experts a RAM tier leaves in the file read through the OS file cache, which must keep them for as long as

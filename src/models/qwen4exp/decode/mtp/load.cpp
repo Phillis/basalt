@@ -1,3 +1,5 @@
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "common.hpp"
 
 namespace basalt::core {
@@ -67,7 +69,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         const cudaError_t alloc = cudaMalloc((void**) &dense_, dense_size);
         if (alloc != cudaSuccess) {
             size_t free_bytes = 0, total_bytes = 0;
-            const cudaError_t info = cudaMemGetInfo(&free_bytes, &total_bytes);
+            const cudaError_t info = basalt::core::gpu_mem_info(&free_bytes, &total_bytes);
             err = "mtp: dense weights allocation failed (" + std::string(cudaGetErrorString(alloc)) +
                   "), requested " + std::to_string(dense_size >> 20) + " MiB, CUDA0 free " +
                   (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
@@ -137,30 +139,49 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     if (windowed && n_stores_ > 0) ring = store_ring * s.page_size;
     // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
     // only, whatever ring shape it takes (a window, or -1: fully resident).
-    const bool kv_hybrid_was = qsa_kv_hybrid();
-    const bool kv_int8_was = qsa_kv_int8();
-    qsa_set_kv_hybrid(false);
-    if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
-    // the draft K/V is elastic like the layers' (its arena grows and shrinks with the session's), except where a
-    // store per batch slot copies whole pools
-    const int64_t kv_elastic_was = qsa_kv_elastic();
-    if (n_stores_ > 0) qsa_set_kv_elastic(0);
-    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
-    if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
-        if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
-        basalt::log::warn("basalt mtp", "no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM");
-        cudaGetLastError();
-        cudaFree(state_arena_);
-        st_ = QsaState{};
-        ring = -1;   // fully resident
+    uint64_t sb = 0;
+    {
+        struct KvFlagGuard {
+            bool hybrid, int8;
+            int64_t elastic;
+            ~KvFlagGuard() {
+                qsa_set_kv_int8(int8);
+                qsa_set_kv_hybrid(hybrid);
+                qsa_set_kv_elastic(elastic);
+            }
+        } kv_flags{qsa_kv_hybrid(), qsa_kv_int8(), qsa_kv_elastic()};
+        qsa_set_kv_hybrid(false);
+        if (kv_flags.hybrid) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+        // the draft K/V is elastic like the layers' (its arena grows and shrinks with the session's), except where a
+        // store per batch slot copies whole pools
+        if (n_stores_ > 0) qsa_set_kv_elastic(0);
         sb = qsa_state_bytes(g, max_cells, false, ring);
-        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) {
+            state_arena_ = nullptr;
+            err = "mtp: the K/V state does not fit";
+            return false;
+        }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+            if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
+            basalt::log::warn("basalt mtp", "no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM");
+            cudaGetLastError();
+            qsa_state_release(st_);
+            cudaFree(state_arena_);
+            state_arena_ = nullptr;
+            st_ = QsaState{};
+            ring = -1;   // fully resident
+            sb = qsa_state_bytes(g, max_cells, false, ring);
+            if (cudaMalloc(&state_arena_, sb) != cudaSuccess) {
+                state_arena_ = nullptr;
+                err = "mtp: the K/V state does not fit";
+                return false;
+            }
+            if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+                err = "mtp: state init failed";
+                return false;
+            }
+        }
     }
-    qsa_set_kv_int8(kv_int8_was);
-    qsa_set_kv_hybrid(kv_hybrid_was);
-    qsa_set_kv_elastic(kv_elastic_was);
     if (st_.kv_arena != nullptr) ss.kv_extra.push_back(st_.kv_arena);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
@@ -269,7 +290,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
+        basalt::core::device_copy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     const int prio = 0;
     if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio) != cudaSuccess) { err = "mtp: stream"; return false; }
